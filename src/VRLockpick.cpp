@@ -24,7 +24,7 @@ namespace
     struct Settings
     {
         bool drivePick{ true };
-        bool leftHandPick{ false };
+        bool leftHandPick{ true };
         float pickDegreesPerHandDegree{ 1.0f };
         float maxPickAngle{ 90.0f };
         bool turnWithHand{ true };
