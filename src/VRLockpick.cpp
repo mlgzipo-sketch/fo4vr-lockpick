@@ -39,6 +39,13 @@ namespace
         // Hand roll at which the lock turns at full speed (like the stick
         // pushed all the way); less roll turns it slower.
         float turnFullDegrees{ 60.0f };
+        // 1 = move the hands around the keyhole (pin like a clock hand,
+        // screwdriver like a lever), 0 = roll the wrists.
+        bool armControl{ true };
+        float armPickSign{ 1.0f };
+        float armTurnStartDegrees{ 12.0f };
+        float armTurnStopDegrees{ 6.0f };
+        float armTurnFullDegrees{ 35.0f };
     };
     Settings g_settings;
 
@@ -124,6 +131,16 @@ namespace
                     g_settings.turnStartDegrees = value;
                 } else if (key == "bSetPinModel") {
                     g_settings.setPinModel = value != 0.0f;
+                } else if (key == "bArmControl") {
+                    g_settings.armControl = value != 0.0f;
+                } else if (key == "fArmPickSign") {
+                    g_settings.armPickSign = value;
+                } else if (key == "fArmTurnStartDegrees") {
+                    g_settings.armTurnStartDegrees = value;
+                } else if (key == "fArmTurnStopDegrees") {
+                    g_settings.armTurnStopDegrees = value;
+                } else if (key == "fArmTurnFullDegrees") {
+                    g_settings.armTurnFullDegrees = value;
                 } else if (key == "fTurnFullDegrees") {
                     g_settings.turnFullDegrees = value;
                 } else if (key == "fPinModelSign") {
@@ -134,9 +151,10 @@ namespace
             }
         } catch (...) {
         }
-        char message[256]{};
-        std::snprintf(message, sizeof(message), "Settings: bDrivePick=%d bLeftHandPick=%d fPickDegreesPerHandDegree=%.2f fMaxPickAngle=%.1f bTurnWithHand=%d fTurnStartDegrees=%.1f fTurnStopDegrees=%.1f fTurnFullDegrees=%.1f",
-            g_settings.drivePick ? 1 : 0, g_settings.leftHandPick ? 1 : 0, g_settings.pickDegreesPerHandDegree, g_settings.maxPickAngle,
+        char message[400]{};
+        std::snprintf(message, sizeof(message), "Settings: bArmControl=%d fArmPickSign=%.0f fArmTurn=%.0f/%.0f/%.0f bDrivePick=%d bLeftHandPick=%d fPickDegreesPerHandDegree=%.2f fMaxPickAngle=%.1f bTurnWithHand=%d fTurnStartDegrees=%.1f fTurnStopDegrees=%.1f fTurnFullDegrees=%.1f",
+            g_settings.armControl ? 1 : 0, g_settings.armPickSign, g_settings.armTurnStartDegrees, g_settings.armTurnStopDegrees,
+            g_settings.armTurnFullDegrees, g_settings.drivePick ? 1 : 0, g_settings.leftHandPick ? 1 : 0, g_settings.pickDegreesPerHandDegree, g_settings.maxPickAngle,
             g_settings.turnWithHand ? 1 : 0, g_settings.turnStartDegrees, g_settings.turnStopDegrees, g_settings.turnFullDegrees);
         vrlockpick::runtime::logNote(message);
     }
@@ -153,6 +171,16 @@ namespace
         bool haveWrench{ false };
         float handRoll{ 0.0f };
         float wrenchRoll{ 0.0f };
+        // Arm control: where each hand is around the keyhole, in degrees
+        // from where it was when the menu opened.
+        bool haveOrbitReference{ false };
+        Vec3 orbitReference;
+        bool haveWrenchOrbitReference{ false };
+        Vec3 wrenchOrbitReference;
+        float handOrbit{ 0.0f };
+        float wrenchOrbit{ 0.0f };
+        float handDistance{ 0.0f };
+        float wrenchDistance{ 0.0f };
         bool handTurning{ false };
         bool pinHeld{ false };
         float heldPickAngle{ 0.0f };
@@ -417,6 +445,70 @@ namespace
         }
     }
 
+    // The keyhole in world space: the pin's rest position, and the axis the
+    // pin turns about (its parent's Y axis). NiTransform: world = R * (s * v) + t.
+    bool keyhole(Vec3& center, Vec3& axis) noexcept
+    {
+        if (!g_pinNode || !g_pinNode->parent || !g_session.haveBasePin) {
+            return false;
+        }
+        auto& parent = *g_pinNode->parent;
+        auto& r = parent.world.rotate;
+        const auto& b = g_session.basePinPos;
+        const float sc = parent.world.scale;
+        center = {
+            parent.world.translate.x + sc * (cell(r, 0, 0) * b.x + cell(r, 0, 1) * b.y + cell(r, 0, 2) * b.z),
+            parent.world.translate.y + sc * (cell(r, 1, 0) * b.x + cell(r, 1, 1) * b.y + cell(r, 1, 2) * b.z),
+            parent.world.translate.z + sc * (cell(r, 2, 0) * b.x + cell(r, 2, 1) * b.y + cell(r, 2, 2) * b.z),
+        };
+        axis = { cell(r, 0, 1), cell(r, 1, 1), cell(r, 2, 1) };
+        const float length = std::sqrt(dot(axis, axis));
+        if (length < 0.001f) {
+            return false;
+        }
+        axis = { axis.x / length, axis.y / length, axis.z / length };
+        return true;
+    }
+
+    // Hand position around the keyhole axis: the part of (hand - center)
+    // across the axis. Returns its length.
+    float acrossAxis(const Vec3& hand, const Vec3& center, const Vec3& axis, Vec3& out) noexcept
+    {
+        const Vec3 d{ hand.x - center.x, hand.y - center.y, hand.z - center.z };
+        const float along = dot(d, axis);
+        out = { d.x - axis.x * along, d.y - axis.y * along, d.z - axis.z * along };
+        return std::sqrt(dot(out, out));
+    }
+
+    // Signed angle from reference to now around the axis, degrees.
+    float orbitDegrees(const Vec3& reference, const Vec3& now, const Vec3& axis) noexcept
+    {
+        return std::atan2(dot(axis, cross(reference, now)), dot(reference, now)) * 180.0f / kPi;
+    }
+
+    // Updates one hand's angle around the keyhole; a hand too close to the
+    // axis keeps its last angle (the direction would be noise).
+    void updateOrbit(const HandPose& pose, bool& haveReference, Vec3& reference, float& angle, float& distance) noexcept
+    {
+        Vec3 center, axis, across;
+        if (!keyhole(center, axis)) {
+            return;
+        }
+        distance = acrossAxis(pose.position, center, axis, across);
+        if (distance < 3.0f) {
+            return;
+        }
+        if (!haveReference) {
+            reference = across;
+            haveReference = true;
+            char message[200]{};
+            std::snprintf(message, sizeof(message), "  orbit reference: keyhole (%.1f, %.1f, %.1f) axis (%.2f, %.2f, %.2f), hand %.1f from the axis",
+                center.x, center.y, center.z, axis.x, axis.y, axis.z, distance);
+            vrlockpick::runtime::logNote(message);
+        }
+        angle = orbitDegrees(reference, across, axis);
+    }
+
     // Runs before the game's AdvanceMovie, so the game moves the pin model,
     // checks the sweet spot and turns the lock with our values, not the stick's.
     void beforeAdvance(RE::LockpickingMenu& menu) noexcept
@@ -435,6 +527,7 @@ namespace
                 s.haveReference = true;
             }
             s.handRoll = rollDegrees(s.reference, pose);
+            updateOrbit(pose, s.haveOrbitReference, s.orbitReference, s.handOrbit, s.handDistance);
         }
         HandPose wrench;
         s.haveWrench = readHand(!g_settings.leftHandPick, wrench);
@@ -444,7 +537,14 @@ namespace
                 s.haveWrenchReference = true;
             }
             s.wrenchRoll = rollDegrees(s.wrenchReference, wrench);
+            updateOrbit(wrench, s.haveWrenchOrbitReference, s.wrenchOrbitReference, s.wrenchOrbit, s.wrenchDistance);
         }
+        const bool arm = g_settings.armControl;
+        const float pickInput = arm ? s.handOrbit * g_settings.armPickSign : s.handRoll;
+        const float turnInput = std::fabs(arm ? s.wrenchOrbit : s.wrenchRoll);
+        const float turnStart = arm ? g_settings.armTurnStartDegrees : g_settings.turnStartDegrees;
+        const float turnStop = arm ? g_settings.armTurnStopDegrees : g_settings.turnStopDegrees;
+        const float turnFull = arm ? g_settings.armTurnFullDegrees : g_settings.turnFullDegrees;
 
         if (menu.animating) {
             return;  // intro and pin-break animations
@@ -456,17 +556,17 @@ namespace
         // every frame (more roll, faster); when the hand is not turned it is
         // left alone and the stick still works.
         if (g_settings.turnWithHand && s.haveWrench && g_turnLock) {
-            const float roll = std::fabs(s.wrenchRoll);
-            if (!s.handTurning && roll > g_settings.turnStartDegrees) {
+            const float roll = turnInput;
+            if (!s.handTurning && roll > turnStart) {
                 s.handTurning = true;
-                vrlockpick::runtime::logInfo(s.wrenchRoll > 0.0f ? "Wrench hand turned (+): lock turn on" : "Wrench hand turned (-): lock turn on");
-            } else if (s.handTurning && roll < g_settings.turnStopDegrees) {
+                vrlockpick::runtime::logInfo("Wrench hand turned: lock turn on");
+            } else if (s.handTurning && roll < turnStop) {
                 s.handTurning = false;
                 g_turnLock(&menu, 0.0f);
                 vrlockpick::runtime::logInfo("Wrench hand back: lock turn off");
             }
             if (s.handTurning) {
-                const float full = std::max(g_settings.turnFullDegrees, g_settings.turnStartDegrees + 1.0f);
+                const float full = std::max(turnFull, turnStart + 1.0f);
                 const float strength = std::clamp(roll / full, 0.3f, 1.0f);
                 g_turnLock(&menu, strength);
             }
@@ -477,12 +577,12 @@ namespace
             if (menu.turningLock || s.handTurning) {
                 if (!s.pinHeld) {
                     s.pinHeld = true;
-                    s.heldPickAngle = clampPick(s.handRoll * g_settings.pickDegreesPerHandDegree);
+                    s.heldPickAngle = clampPick(pickInput * g_settings.pickDegreesPerHandDegree);
                 }
                 menu.pickAngle = s.heldPickAngle;
             } else {
                 s.pinHeld = false;
-                menu.pickAngle = clampPick(s.handRoll * g_settings.pickDegreesPerHandDegree);
+                menu.pickAngle = clampPick(pickInput * g_settings.pickDegreesPerHandDegree);
             }
         }
     }
@@ -527,8 +627,8 @@ namespace
         if (now - s.lastLog > std::chrono::milliseconds(500) &&
             (std::fabs(menu.pickAngle - s.lastPickAngle) > 0.5f || std::fabs(menu.lockAngle - s.lastLockAngle) > 0.5f)) {
             char message[256]{};
-            std::snprintf(message, sizeof(message), "  pick=%.1f gamePin=%.1f lock=%.1f handRoll=%.1f wrenchRoll=%.1f (hands %s/%s) sweet=%.1f+-%.1f",
-                menu.pickAngle, s.gamePinAngle, menu.lockAngle, s.handRoll, s.wrenchRoll, s.haveHand ? "ok" : "missing", s.haveWrench ? "ok" : "missing",
+            std::snprintf(message, sizeof(message), "  pick=%.1f gamePin=%.1f lock=%.1f handRoll=%.1f wrenchRoll=%.1f orbit=%.1f/%.1f dist=%.1f/%.1f (hands %s/%s) sweet=%.1f+-%.1f",
+                menu.pickAngle, s.gamePinAngle, menu.lockAngle, s.handRoll, s.wrenchRoll, s.handOrbit, s.wrenchOrbit, s.handDistance, s.wrenchDistance, s.haveHand ? "ok" : "missing", s.haveWrench ? "ok" : "missing",
                 menu.sweetSpotCenter, menu.sweetSpotLength * 0.5f);
             vrlockpick::runtime::logInfo(message);
             s.lastLog = now;
