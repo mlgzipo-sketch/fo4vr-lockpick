@@ -1,6 +1,6 @@
 // VRLockpick: pick locks with your own hands in Fallout 4 VR.
-// Step 1: watch the game's lockpicking menu, log what it does, and turn the
-// bobby pin with the roll of the pick hand instead of the thumbstick.
+// The bobby pin follows the roll of one hand and the lock turns when the
+// other hand rolls like a screwdriver; the game's own rules do the rest.
 #include <ROCK/Hands.h>
 #include "Runtime.h"
 
@@ -27,6 +27,9 @@ namespace
         bool leftHandPick{ false };
         float pickDegreesPerHandDegree{ 1.0f };
         float maxPickAngle{ 90.0f };
+        bool turnWithHand{ true };
+        float turnStartDegrees{ 25.0f };
+        float turnStopDegrees{ 15.0f };
     };
     Settings g_settings;
 
@@ -106,13 +109,20 @@ namespace
                     g_settings.pickDegreesPerHandDegree = value;
                 } else if (key == "fMaxPickAngle") {
                     g_settings.maxPickAngle = value;
+                } else if (key == "bTurnWithHand") {
+                    g_settings.turnWithHand = value != 0.0f;
+                } else if (key == "fTurnStartDegrees") {
+                    g_settings.turnStartDegrees = value;
+                } else if (key == "fTurnStopDegrees") {
+                    g_settings.turnStopDegrees = value;
                 }
             }
         } catch (...) {
         }
-        char message[192]{};
-        std::snprintf(message, sizeof(message), "Settings: bDrivePick=%d bLeftHandPick=%d fPickDegreesPerHandDegree=%.2f fMaxPickAngle=%.1f",
-            g_settings.drivePick ? 1 : 0, g_settings.leftHandPick ? 1 : 0, g_settings.pickDegreesPerHandDegree, g_settings.maxPickAngle);
+        char message[256]{};
+        std::snprintf(message, sizeof(message), "Settings: bDrivePick=%d bLeftHandPick=%d fPickDegreesPerHandDegree=%.2f fMaxPickAngle=%.1f bTurnWithHand=%d fTurnStartDegrees=%.1f fTurnStopDegrees=%.1f",
+            g_settings.drivePick ? 1 : 0, g_settings.leftHandPick ? 1 : 0, g_settings.pickDegreesPerHandDegree, g_settings.maxPickAngle,
+            g_settings.turnWithHand ? 1 : 0, g_settings.turnStartDegrees, g_settings.turnStopDegrees);
         vrlockpick::runtime::logNote(message);
     }
 
@@ -122,6 +132,15 @@ namespace
         bool active{ false };
         bool haveReference{ false };
         HandPose reference;
+        bool haveWrenchReference{ false };
+        HandPose wrenchReference;
+        bool haveHand{ false };
+        bool haveWrench{ false };
+        float handRoll{ 0.0f };
+        float wrenchRoll{ 0.0f };
+        bool handTurning{ false };
+        bool pinHeld{ false };
+        float heldPickAngle{ 0.0f };
         std::uint64_t menuFrames{ 0 };
         std::uint64_t rockFramesAtOpen{ 0 };
         Clock::time_point lastLog{};
@@ -154,59 +173,112 @@ namespace
         vrlockpick::runtime::logNote(message);
     }
 
-    void onMenuFrame(RE::LockpickingMenu& menu) noexcept
+    float clampPick(const float angle) noexcept
+    {
+        if (angle > g_settings.maxPickAngle) {
+            return g_settings.maxPickAngle;
+        }
+        if (angle < -g_settings.maxPickAngle) {
+            return -g_settings.maxPickAngle;
+        }
+        return angle;
+    }
+
+    void openSession(RE::LockpickingMenu& menu) noexcept
     {
         auto& s = g_session;
-        const auto now = Clock::now();
+        s = Session{};
+        s.active = true;
+        s.rockFramesAtOpen = g_rockFrames;
+        s.lastLog = Clock::now();
+        logMenuState("Lockpicking opened", menu);
+        logPoint("lockRoot", menu.lockRoot.get());
+        if (auto* player = RE::PlayerCharacter::GetSingleton()) {
+            logPoint("lockPickParentNode", player->vrNodes.lockPickParentNode);
+            logPoint("primaryWand", player->vrNodes.primaryWandNode);
+            logPoint("hmd", player->vrNodes.hmdNode);
+        }
+        HandPose right, left;
+        if (readHand(false, right)) {
+            char message[160]{};
+            std::snprintf(message, sizeof(message), "  right hand: (%.1f, %.1f, %.1f)", right.position.x, right.position.y, right.position.z);
+            vrlockpick::runtime::logNote(message);
+        }
+        if (readHand(true, left)) {
+            char message[160]{};
+            std::snprintf(message, sizeof(message), "  left hand: (%.1f, %.1f, %.1f)", left.position.x, left.position.y, left.position.z);
+            vrlockpick::runtime::logNote(message);
+        }
+    }
+
+    // Runs before the game's AdvanceMovie, so the game moves the pin model,
+    // checks the sweet spot and turns the lock with our values, not the stick's.
+    void beforeAdvance(RE::LockpickingMenu& menu) noexcept
+    {
+        auto& s = g_session;
         if (!s.active) {
-            s = Session{};
-            s.active = true;
-            s.rockFramesAtOpen = g_rockFrames;
-            s.lastLog = now;
-            logMenuState("Lockpicking opened", menu);
-            logPoint("lockRoot", menu.lockRoot.get());
-            if (auto* player = RE::PlayerCharacter::GetSingleton()) {
-                logPoint("lockPickParentNode", player->vrNodes.lockPickParentNode);
-                logPoint("primaryWand", player->vrNodes.primaryWandNode);
-                logPoint("hmd", player->vrNodes.hmdNode);
-            }
-            HandPose right, left;
-            if (readHand(false, right)) {
-                char message[160]{};
-                std::snprintf(message, sizeof(message), "  right hand: (%.1f, %.1f, %.1f)", right.position.x, right.position.y, right.position.z);
-                vrlockpick::runtime::logNote(message);
-            }
-            if (readHand(true, left)) {
-                char message[160]{};
-                std::snprintf(message, sizeof(message), "  left hand: (%.1f, %.1f, %.1f)", left.position.x, left.position.y, left.position.z);
-                vrlockpick::runtime::logNote(message);
-            }
+            openSession(menu);
         }
         ++s.menuFrames;
 
-        float handRoll = 0.0f;
-        bool haveHand = false;
         HandPose pose;
-        if (readHand(g_settings.leftHandPick, pose)) {
+        s.haveHand = readHand(g_settings.leftHandPick, pose);
+        if (s.haveHand) {
             if (!s.haveReference) {
                 s.reference = pose;
                 s.haveReference = true;
             }
-            handRoll = rollDegrees(s.reference, pose);
-            haveHand = true;
+            s.handRoll = rollDegrees(s.reference, pose);
         }
-
-        // Don't fight the game's own intro/break animations.
-        if (g_settings.drivePick && haveHand && !menu.animating && !menu.turningLock) {
-            float angle = handRoll * g_settings.pickDegreesPerHandDegree;
-            if (angle > g_settings.maxPickAngle) {
-                angle = g_settings.maxPickAngle;
-            } else if (angle < -g_settings.maxPickAngle) {
-                angle = -g_settings.maxPickAngle;
+        HandPose wrench;
+        s.haveWrench = readHand(!g_settings.leftHandPick, wrench);
+        if (s.haveWrench) {
+            if (!s.haveWrenchReference) {
+                s.wrenchReference = wrench;
+                s.haveWrenchReference = true;
             }
-            menu.pickAngle = angle;
+            s.wrenchRoll = rollDegrees(s.wrenchReference, wrench);
         }
 
+        if (menu.animating) {
+            return;  // intro and pin-break animations
+        }
+
+        // The other hand turns the lock like a screwdriver: roll it past
+        // fTurnStartDegrees to start, back under fTurnStopDegrees to let go.
+        // Only the crossings are written, so the game's turn button still works.
+        if (g_settings.turnWithHand && s.haveWrench) {
+            const float roll = std::fabs(s.wrenchRoll);
+            if (!s.handTurning && roll > g_settings.turnStartDegrees) {
+                s.handTurning = true;
+                menu.turningLock = true;
+                vrlockpick::runtime::logInfo(s.wrenchRoll > 0.0f ? "Wrench hand turned (+): lock turn on" : "Wrench hand turned (-): lock turn on");
+            } else if (s.handTurning && roll < g_settings.turnStopDegrees) {
+                s.handTurning = false;
+                menu.turningLock = false;
+                vrlockpick::runtime::logInfo("Wrench hand back: lock turn off");
+            }
+        }
+
+        if (g_settings.drivePick && s.haveHand) {
+            // The pin can't move while the lock is under tension.
+            if (menu.turningLock) {
+                if (!s.pinHeld) {
+                    s.pinHeld = true;
+                    s.heldPickAngle = clampPick(s.handRoll * g_settings.pickDegreesPerHandDegree);
+                }
+                menu.pickAngle = s.heldPickAngle;
+            } else {
+                s.pinHeld = false;
+                menu.pickAngle = clampPick(s.handRoll * g_settings.pickDegreesPerHandDegree);
+            }
+        }
+    }
+
+    void afterAdvance(RE::LockpickingMenu& menu) noexcept
+    {
+        auto& s = g_session;
+        const auto now = Clock::now();
         const bool changed = menu.turningLock != s.lastTurning || menu.picksBroken != s.lastPicksBroken;
         if (changed) {
             logMenuState(menu.picksBroken != s.lastPicksBroken ? "Pick broke" : (menu.turningLock ? "Lock turn started" : "Lock turn stopped"), menu);
@@ -214,8 +286,9 @@ namespace
         if (now - s.lastLog > std::chrono::milliseconds(500) &&
             (std::fabs(menu.pickAngle - s.lastPickAngle) > 0.5f || std::fabs(menu.lockAngle - s.lastLockAngle) > 0.5f)) {
             char message[256]{};
-            std::snprintf(message, sizeof(message), "  pick=%.1f lock=%.1f handRoll=%.1f (hand %s) sweet=%.1f+-%.1f",
-                menu.pickAngle, menu.lockAngle, handRoll, haveHand ? "ok" : "missing", menu.sweetSpotCenter, menu.sweetSpotLength * 0.5f);
+            std::snprintf(message, sizeof(message), "  pick=%.1f lock=%.1f handRoll=%.1f wrenchRoll=%.1f (hands %s/%s) sweet=%.1f+-%.1f",
+                menu.pickAngle, menu.lockAngle, s.handRoll, s.wrenchRoll, s.haveHand ? "ok" : "missing", s.haveWrench ? "ok" : "missing",
+                menu.sweetSpotCenter, menu.sweetSpotLength * 0.5f);
             vrlockpick::runtime::logInfo(message);
             s.lastLog = now;
         }
@@ -231,10 +304,16 @@ namespace
 
     void hookedAdvanceMovie(RE::LockpickingMenu* menu, const float timeDelta, const std::uint64_t time)
     {
+        if (menu) {
+            try {
+                beforeAdvance(*menu);
+            } catch (...) {
+            }
+        }
         g_originalAdvanceMovie(menu, timeDelta, time);
         if (menu) {
             try {
-                onMenuFrame(*menu);
+                afterAdvance(*menu);
             } catch (...) {
             }
         }
