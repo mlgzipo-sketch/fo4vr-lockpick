@@ -35,7 +35,9 @@ namespace
         float turnStartDegrees{ 25.0f };
         float turnStopDegrees{ 15.0f };
         float pinModelSign{ 1.0f };
-        bool setPinModel{ false };
+        bool setPinModel{ true };
+        float pinPivotX{ 1.2f };
+        float pinPivotZ{ -1.15f };
     };
     Settings g_settings;
 
@@ -121,6 +123,10 @@ namespace
                     g_settings.turnStartDegrees = value;
                 } else if (key == "bSetPinModel") {
                     g_settings.setPinModel = value != 0.0f;
+                } else if (key == "fPinPivotX") {
+                    g_settings.pinPivotX = value;
+                } else if (key == "fPinPivotZ") {
+                    g_settings.pinPivotZ = value;
                 } else if (key == "fPinModelSign") {
                     g_settings.pinModelSign = value;
                 } else if (key == "fTurnStopDegrees") {
@@ -152,6 +158,11 @@ namespace
         bool pinHeld{ false };
         float heldPickAngle{ 0.0f };
         float gamePinAngle{ 0.0f };
+        bool haveBasePin{ false };
+        RE::NiPoint3 basePinPos;
+        bool pinWritten{ false };
+        float writtenPinAngle{ 0.0f };
+        RE::NiPoint3 writtenPinPos;
         std::uint64_t menuFrames{ 0 };
         std::uint64_t rockFramesAtOpen{ 0 };
         Clock::time_point lastLog{};
@@ -414,13 +425,38 @@ namespace
     {
         auto& s = g_session;
         const auto now = Clock::now();
-        // The game has just placed the pin model from pickAngle; note its angle.
-        // Test 4 showed it already follows the hand, so turning the model
-        // ourselves (bSetPinModel) is off by default.
+        // The game turns the pin model (LockPick01) only when the stick moves,
+        // not from pickAngle, so the model is turned here every frame. The
+        // game turns it about the keyhole, so its position moves too: it is
+        // kept at base + p - R*p, p being the pivot (fPinPivotX/Z).
         if (g_pinNode) {
             s.gamePinAngle = pinNodeDegrees(g_pinNode);
-            if (g_settings.setPinModel && g_settings.drivePick && s.haveHand && !menu.animating) {
-                setPinNodeDegrees(g_pinNode, menu.pickAngle * g_settings.pinModelSign);
+            auto& t = g_pinNode->local.translate;
+            const bool gameMoved = !s.pinWritten || std::fabs(s.gamePinAngle - s.writtenPinAngle) > 0.2f ||
+                                   std::fabs(t.x - s.writtenPinPos.x) + std::fabs(t.z - s.writtenPinPos.z) > 0.01f;
+            if (gameMoved && s.pinWritten) {
+                char message[160]{};
+                std::snprintf(message, sizeof(message), "    game moved pin: angle %.2f pos (%.3f, %.3f, %.3f)", s.gamePinAngle, t.x, t.y, t.z);
+                vrlockpick::runtime::logInfo(message);
+            }
+            if (!s.haveBasePin && !menu.animating && std::fabs(s.gamePinAngle) < 0.5f) {
+                s.basePinPos = t;
+                s.haveBasePin = true;
+            }
+            if (g_settings.setPinModel && g_settings.drivePick && s.haveHand && s.haveBasePin && !menu.animating) {
+                const float degrees = menu.pickAngle * g_settings.pinModelSign;
+                setPinNodeDegrees(g_pinNode, degrees);
+                const float r = degrees * kPi / 180.0f;
+                const float c = std::cos(r);
+                const float sn = std::sin(r);
+                const float px = g_settings.pinPivotX;
+                const float pz = g_settings.pinPivotZ;
+                t.x = s.basePinPos.x + px - (c * px + sn * pz);
+                t.y = s.basePinPos.y;
+                t.z = s.basePinPos.z + pz - (-sn * px + c * pz);
+                s.pinWritten = true;
+                s.writtenPinAngle = degrees;
+                s.writtenPinPos = t;
             }
         }
         const bool changed = menu.turningLock != s.lastTurning || menu.picksBroken != s.lastPicksBroken;
