@@ -2,6 +2,7 @@
 // The bobby pin follows the roll of one hand and the lock turns when the
 // other hand rolls like a screwdriver; the game's own rules do the rest.
 #include <ROCK/Hands.h>
+#include <ROCK/Input.h>
 #include "Grip.h"
 #include "Runtime.h"
 
@@ -22,6 +23,7 @@
 namespace
 {
     namespace hands = rock::api::hands;
+    namespace input = rock::api::input;
     using Clock = std::chrono::steady_clock;
 
     constexpr float kPi = 3.14159265f;
@@ -45,13 +47,19 @@ namespace
         bool armControl{ true };
         bool gripFingers{ true };
         float armPickSign{ 1.0f };
-        float armTurnStartDegrees{ 12.0f };
-        float armTurnStopDegrees{ 6.0f };
+        float armTurnStartDegrees{ 10.0f };
+        float armTurnStopDegrees{ 5.0f };
         float armTurnFullDegrees{ 35.0f };
+        // Arm control: the pin moves only while the trigger is held (held
+        // in the fingers); the screwdriver turns like a bolt, the lock
+        // following the twist (a quarter turn opens it).
+        bool pinNeedsTrigger{ true };
+        float screwLockDegreesPerTwist{ 1.0f };
     };
     Settings g_settings;
 
     const hands::ApiV1* g_hands{};
+    const input::ApiV1* g_input{};
     std::uint64_t g_ownerToken{ 0 };
     std::uint64_t g_rockFrames{ 0 };
 
@@ -135,6 +143,10 @@ namespace
                     g_settings.setPinModel = value != 0.0f;
                 } else if (key == "bGripFingers") {
                     g_settings.gripFingers = value != 0.0f;
+                } else if (key == "bPinNeedsTrigger") {
+                    g_settings.pinNeedsTrigger = value != 0.0f;
+                } else if (key == "fScrewLockDegreesPerTwist") {
+                    g_settings.screwLockDegreesPerTwist = value;
                 } else if (key == "bArmControl") {
                     g_settings.armControl = value != 0.0f;
                 } else if (key == "fArmPickSign") {
@@ -185,6 +197,16 @@ namespace
         float wrenchOrbit{ 0.0f };
         float handDistance{ 0.0f };
         float wrenchDistance{ 0.0f };
+        // Pin held by the trigger: angles where it was taken.
+        bool pinGrabbed{ false };
+        float grabOrbit{ 0.0f };
+        float grabPickAngle{ 0.0f };
+        float armPickAngle{ 0.0f };
+        // Screwdriver twist around the keyhole axis.
+        bool haveTwistReference{ false };
+        bool twistUsesFingers{ false };
+        Vec3 twistReference;
+        float wrenchTwist{ 0.0f };
         bool handTurning{ false };
         bool pinHeld{ false };
         float heldPickAngle{ 0.0f };
@@ -513,6 +535,99 @@ namespace
         angle = orbitDegrees(reference, across, axis);
     }
 
+    // Twist of the screwdriver hand around the keyhole axis: the angle of a
+    // hand axis across the keyhole (its side, or the fingers if the side
+    // points along the keyhole) since the menu opened.
+    void updateTwist(const HandPose& pose) noexcept
+    {
+        auto& s = g_session;
+        Vec3 center, axis;
+        if (!keyhole(center, axis)) {
+            return;
+        }
+        if (!s.haveTwistReference) {
+            s.twistUsesFingers = std::fabs(dot(pose.side, axis)) > 0.8f;
+        }
+        const Vec3& v = s.twistUsesFingers ? pose.alongFingers : pose.side;
+        const float along = dot(v, axis);
+        const Vec3 across{ v.x - axis.x * along, v.y - axis.y * along, v.z - axis.z * along };
+        if (dot(across, across) < 0.04f) {
+            return;  // that hand axis points along the keyhole right now
+        }
+        if (!s.haveTwistReference) {
+            s.twistReference = across;
+            s.haveTwistReference = true;
+        }
+        s.wrenchTwist = orbitDegrees(s.twistReference, across, axis);
+    }
+
+    bool triggerHeld(const bool left) noexcept
+    {
+        if (!g_input || g_ownerToken == 0) {
+            return true;  // no input API: the pin always follows the hand
+        }
+        // OpenVR k_EButton_SteamVR_Trigger.
+        constexpr std::uint32_t kTriggerButton = 33;
+        input::RawWandButtonStateV1 button{};
+        const auto status = g_input->getRawWandButtonStateV1(g_ownerToken, left ? rock::api::Hand::Left : rock::api::Hand::Right, kTriggerButton, &button);
+        return status == rock::api::Status::Ok && button.available && button.held;
+    }
+
+    float wrapDegrees(float angle) noexcept
+    {
+        while (angle > 180.0f) {
+            angle -= 360.0f;
+        }
+        while (angle < -180.0f) {
+            angle += 360.0f;
+        }
+        return angle;
+    }
+
+    // Arm control (bArmControl): pin and screwdriver.
+    void armControl(RE::LockpickingMenu& menu) noexcept
+    {
+        auto& s = g_session;
+        // Screwdriver: the lock follows the twist, a quarter turn = 90.
+        if (g_settings.turnWithHand && s.haveWrench && g_turnLock && s.haveTwistReference) {
+            const float target = std::fabs(s.wrenchTwist) * g_settings.screwLockDegreesPerTwist;
+            if (!s.handTurning && target > g_settings.armTurnStartDegrees) {
+                s.handTurning = true;
+                vrlockpick::runtime::logInfo("Screwdriver twisted: lock turn on");
+            } else if (s.handTurning && target < g_settings.armTurnStopDegrees) {
+                s.handTurning = false;
+                g_turnLock(&menu, 0.0f);
+                vrlockpick::runtime::logInfo("Screwdriver back: lock turn off");
+            }
+            if (s.handTurning) {
+                // Catch up with the hand; a tiny value just keeps the tension.
+                const float behind = target - menu.lockAngle;
+                const float strength = behind > 1.0f ? std::clamp(behind / 15.0f, 0.15f, 1.0f) : 0.0005f;
+                g_turnLock(&menu, strength);
+            }
+        }
+
+        // Pin: held while the trigger is, moving with the hand around the keyhole.
+        if (g_settings.drivePick && s.haveHand) {
+            const bool trigger = !g_settings.pinNeedsTrigger || triggerHeld(g_settings.leftHandPick);
+            const bool canMove = !menu.turningLock && !s.handTurning;
+            if (trigger && canMove && !s.pinGrabbed) {
+                s.pinGrabbed = true;
+                s.grabOrbit = s.handOrbit;
+                s.grabPickAngle = s.armPickAngle;
+                vrlockpick::runtime::logInfo("Pin taken");
+            } else if (s.pinGrabbed && (!trigger || !canMove)) {
+                s.pinGrabbed = false;
+                vrlockpick::runtime::logInfo("Pin let go");
+            }
+            if (s.pinGrabbed) {
+                const float moved = wrapDegrees(s.handOrbit - s.grabOrbit) * g_settings.armPickSign * g_settings.pickDegreesPerHandDegree;
+                s.armPickAngle = clampPick(s.grabPickAngle + moved);
+            }
+            menu.pickAngle = s.armPickAngle;
+        }
+    }
+
     // Runs before the game's AdvanceMovie, so the game moves the pin model,
     // checks the sweet spot and turns the lock with our values, not the stick's.
     void beforeAdvance(RE::LockpickingMenu& menu) noexcept
@@ -542,6 +657,7 @@ namespace
             }
             s.wrenchRoll = rollDegrees(s.wrenchReference, wrench);
             updateOrbit(wrench, s.haveWrenchOrbitReference, s.wrenchOrbitReference, s.wrenchOrbit, s.wrenchDistance);
+            updateTwist(wrench);
         }
         const bool arm = g_settings.armControl;
         const float pickInput = arm ? s.handOrbit * g_settings.armPickSign : s.handRoll;
@@ -556,6 +672,10 @@ namespace
         if (g_settings.gripFingers) {
             vrlockpick::grip::hold(g_settings.leftHandPick, true);
             vrlockpick::grip::hold(!g_settings.leftHandPick, false);
+        }
+        if (arm) {
+            armControl(menu);
+            return;
         }
 
         // The other hand turns the lock like a screwdriver: roll it past
@@ -635,8 +755,8 @@ namespace
         if (now - s.lastLog > std::chrono::milliseconds(500) &&
             (std::fabs(menu.pickAngle - s.lastPickAngle) > 0.5f || std::fabs(menu.lockAngle - s.lastLockAngle) > 0.5f)) {
             char message[256]{};
-            std::snprintf(message, sizeof(message), "  pick=%.1f gamePin=%.1f lock=%.1f handRoll=%.1f wrenchRoll=%.1f orbit=%.1f/%.1f dist=%.1f/%.1f (hands %s/%s) sweet=%.1f+-%.1f",
-                menu.pickAngle, s.gamePinAngle, menu.lockAngle, s.handRoll, s.wrenchRoll, s.handOrbit, s.wrenchOrbit, s.handDistance, s.wrenchDistance, s.haveHand ? "ok" : "missing", s.haveWrench ? "ok" : "missing",
+            std::snprintf(message, sizeof(message), "  pick=%.1f gamePin=%.1f lock=%.1f handRoll=%.1f wrenchRoll=%.1f orbit=%.1f/%.1f twist=%.1f%s dist=%.1f/%.1f (hands %s/%s) sweet=%.1f+-%.1f",
+                menu.pickAngle, s.gamePinAngle, menu.lockAngle, s.handRoll, s.wrenchRoll, s.handOrbit, s.wrenchOrbit, s.wrenchTwist, s.pinGrabbed ? " held" : "", s.handDistance, s.wrenchDistance, s.haveHand ? "ok" : "missing", s.haveWrench ? "ok" : "missing",
                 menu.sweetSpotCenter, menu.sweetSpotLength * 0.5f);
             vrlockpick::runtime::logInfo(message);
             s.lastLog = now;
@@ -750,6 +870,10 @@ namespace
         if (client.acquire(static_cast<std::uint32_t>(hands::PermissionV1::Read), g_hands) != rock::api::Status::Ok) {
             g_hands = nullptr;
             vrlockpick::runtime::logWarning("ROCK hands interface unavailable; the pick can't follow the hand");
+        }
+        if (client.acquire(static_cast<std::uint32_t>(input::PermissionV1::Read), g_input) != rock::api::Status::Ok) {
+            g_input = nullptr;
+            vrlockpick::runtime::logWarning("ROCK input interface unavailable; the pin moves without the trigger");
         }
         return true;
     }
