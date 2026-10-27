@@ -42,20 +42,21 @@ namespace vrlockpick::grip
         FRIKApiV2::HandPoseData poseFor(const bool pinch) noexcept
         {
             FRIKApiV2::HandPoseData pose{};
+            // From the user's 3D reference (bend per joint, 90 degrees = closed).
             if (pinch) {
-                // Bobby pin between thumb and index; the other fingers curled away.
-                pose.thumb = { 0.45f, 0.5f, 0.55f, 0.0f };
-                pose.index = { 0.5f, 0.45f, 0.5f, 0.0f };
-                pose.middle = { 0.25f, 0.2f, 0.3f, 0.0f };
-                pose.ring = { 0.2f, 0.15f, 0.25f, 0.0f };
-                pose.pinky = { 0.15f, 0.15f, 0.2f, 0.0f };
+                // Bobby pin pinched by thumb and index; the others curled.
+                pose.thumb = { 1.0f, 1.0f, 0.82f, 0.0f };
+                pose.index = { 0.87f, 0.41f, 0.87f, 0.0f };
+                pose.middle = { 0.68f, 0.65f, 0.65f, 0.0f };
+                pose.ring = { 0.51f, 0.36f, 0.35f, 0.0f };
+                pose.pinky = { 0.55f, 0.36f, 0.35f, 0.0f };
             } else {
-                // Screwdriver handle in a fist.
-                pose.thumb = { 0.35f, 0.35f, 0.4f, 0.0f };
-                pose.index = { 0.25f, 0.25f, 0.3f, 0.0f };
-                pose.middle = { 0.2f, 0.2f, 0.25f, 0.0f };
-                pose.ring = { 0.2f, 0.2f, 0.25f, 0.0f };
-                pose.pinky = { 0.2f, 0.2f, 0.25f, 0.0f };
+                // Screwdriver handle in the palm, thumb along it.
+                pose.thumb = { 1.0f, 1.0f, 1.0f, 0.0f };
+                pose.index = { 1.0f, 0.59f, 0.86f, 0.0f };
+                pose.middle = { 0.63f, 0.3f, 0.3f, 0.0f };
+                pose.ring = { 0.65f, 0.31f, 0.54f, 0.0f };
+                pose.pinky = { 0.86f, 0.45f, 0.45f, 0.0f };
             }
             return pose;
         }

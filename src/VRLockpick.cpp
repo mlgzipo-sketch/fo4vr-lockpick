@@ -53,7 +53,11 @@ namespace
         // Arm control: the pin moves only while the trigger is held (held
         // in the fingers); the screwdriver turns like a bolt, the lock
         // following the twist (a quarter turn opens it).
-        bool pinNeedsTrigger{ true };
+        bool pinNeedsTrigger{ false };
+        // The tools start in the hands; bringing a tool's tip this close to
+        // the keyhole puts it in place.
+        bool toolsInHands{ true };
+        float dockDistance{ 6.0f };
         // 0 = the screwdriver hand swings around the keyhole (as in the
         // user's 3D reference), 1 = it twists in place like a bolt.
         bool screwTwist{ false };
@@ -146,6 +150,10 @@ namespace
                     g_settings.setPinModel = value != 0.0f;
                 } else if (key == "bGripFingers") {
                     g_settings.gripFingers = value != 0.0f;
+                } else if (key == "bToolsInHands") {
+                    g_settings.toolsInHands = value != 0.0f;
+                } else if (key == "fDockDistance") {
+                    g_settings.dockDistance = value;
                 } else if (key == "bScrewTwist") {
                     g_settings.screwTwist = value != 0.0f;
                 } else if (key == "bPinNeedsTrigger") {
@@ -202,6 +210,10 @@ namespace
         float wrenchOrbit{ 0.0f };
         float handDistance{ 0.0f };
         float wrenchDistance{ 0.0f };
+        // Tools in the hands until brought to the keyhole.
+        bool toolsPrepared{ false };
+        bool pinDocked{ true };
+        bool screwDocked{ true };
         // Pin held by the trigger: angles where it was taken.
         bool pinGrabbed{ false };
         float grabOrbit{ 0.0f };
@@ -266,6 +278,7 @@ namespace
     std::vector<TrackedNode> g_nodes;
     // The node the game turns when the stick moves the pin (found in test 3).
     RE::NiAVObject* g_pinNode{ nullptr };
+    RE::NiAVObject* g_screwNode{ nullptr };
 
     // NiMatrix3 rows are NiPoint4 (x, y, z, w).
     float& cell(RE::NiMatrix3& m, const int row, const int column) noexcept
@@ -335,6 +348,8 @@ namespace
         TrackedNode tracked{ object, depth };
         if (object->GetName() == "LockPick01") {
             g_pinNode = object;
+        } else if (object->GetName() == "screwdriver") {
+            g_screwNode = object;
         }
         eulerDegrees(object, tracked.euler);
         g_nodes.push_back(tracked);
@@ -458,6 +473,7 @@ namespace
             logPoint("lockPickParentNode", player->vrNodes.lockPickParentNode);
             g_nodes.clear();
             g_pinNode = nullptr;
+            g_screwNode = nullptr;
             g_haveMenuFloats = false;
             collectNodes(player->vrNodes.lockPickParentNode, 0);
             logPoint("primaryWand", player->vrNodes.primaryWandNode);
@@ -477,7 +493,9 @@ namespace
     }
 
     // The keyhole in world space: the pin's rest position, and the axis the
-    // pin turns about (its parent's Y axis). NiTransform: world = R * (s * v) + t.
+    // pin turns about (its parent's Y axis). Node matrices are row-style (as
+    // FRIK uses them): rows are the node's axes in world, so a local point
+    // goes to world as t + R^T * (s * v) and a world vector to local as R * v.
     bool keyhole(Vec3& center, Vec3& axis) noexcept
     {
         if (!g_pinNode || !g_pinNode->parent || !g_session.haveBasePin) {
@@ -488,11 +506,11 @@ namespace
         const auto& b = g_session.basePinPos;
         const float sc = parent.world.scale;
         center = {
-            parent.world.translate.x + sc * (cell(r, 0, 0) * b.x + cell(r, 0, 1) * b.y + cell(r, 0, 2) * b.z),
-            parent.world.translate.y + sc * (cell(r, 1, 0) * b.x + cell(r, 1, 1) * b.y + cell(r, 1, 2) * b.z),
-            parent.world.translate.z + sc * (cell(r, 2, 0) * b.x + cell(r, 2, 1) * b.y + cell(r, 2, 2) * b.z),
+            parent.world.translate.x + sc * (cell(r, 0, 0) * b.x + cell(r, 1, 0) * b.y + cell(r, 2, 0) * b.z),
+            parent.world.translate.y + sc * (cell(r, 0, 1) * b.x + cell(r, 1, 1) * b.y + cell(r, 2, 1) * b.z),
+            parent.world.translate.z + sc * (cell(r, 0, 2) * b.x + cell(r, 1, 2) * b.y + cell(r, 2, 2) * b.z),
         };
-        axis = { cell(r, 0, 1), cell(r, 1, 1), cell(r, 2, 1) };
+        axis = { cell(r, 1, 0), cell(r, 1, 1), cell(r, 1, 2) };
         const float length = std::sqrt(dot(axis, axis));
         if (length < 0.001f) {
             return false;
@@ -589,6 +607,190 @@ namespace
         return angle;
     }
 
+    // ---- Tools in the hands ----
+    // Each tool is described in its own space: the tip (the point in the
+    // keyhole) and the hold point (where the fingers are). Measured once
+    // the intro is over, from where the game put the tool and its bounds.
+    struct Tool
+    {
+        RE::NiAVObject* node{ nullptr };
+        RE::NiTransform rest;  // local transform the game gave it
+        Vec3 tip;
+        Vec3 hold;
+        Vec3 side;  // the keyhole axis, in tool space
+    };
+    Tool g_pin;
+    Tool g_screw;
+
+    Vec3 worldToLocalDir(const RE::NiMatrix3& r, const Vec3& v) noexcept
+    {
+        auto& m = const_cast<RE::NiMatrix3&>(r);
+        return {
+            cell(m, 0, 0) * v.x + cell(m, 0, 1) * v.y + cell(m, 0, 2) * v.z,
+            cell(m, 1, 0) * v.x + cell(m, 1, 1) * v.y + cell(m, 1, 2) * v.z,
+            cell(m, 2, 0) * v.x + cell(m, 2, 1) * v.y + cell(m, 2, 2) * v.z,
+        };
+    }
+
+    Vec3 normalized(const Vec3& v) noexcept
+    {
+        const float length = std::sqrt(dot(v, v));
+        return length > 1e-5f ? Vec3{ v.x / length, v.y / length, v.z / length } : Vec3{ 1.0f, 0.0f, 0.0f };
+    }
+
+    Vec3 sub(const Vec3& a, const Vec3& b) noexcept { return { a.x - b.x, a.y - b.y, a.z - b.z }; }
+    Vec3 fromNi(const RE::NiPoint3& p) noexcept { return { p.x, p.y, p.z }; }
+
+    bool prepareTool(Tool& tool, RE::NiAVObject* node, const float holdFraction, const char* name) noexcept
+    {
+        Vec3 center, axis;
+        if (!node || !node->parent || !keyhole(center, axis)) {
+            return false;
+        }
+        tool.node = node;
+        tool.rest = node->local;
+        const auto& w = node->world;
+        const float sc = w.scale > 1e-4f ? w.scale : 1.0f;
+        const Vec3 origin = fromNi(w.translate);
+        const Vec3 tip = worldToLocalDir(w.rotate, sub(center, origin));
+        const Vec3 mid = worldToLocalDir(w.rotate, sub(fromNi(node->worldBound.center), origin));
+        tool.tip = { tip.x / sc, tip.y / sc, tip.z / sc };
+        const Vec3 boundCenter{ mid.x / sc, mid.y / sc, mid.z / sc };
+        // The far end is opposite the tip across the bound's center.
+        const Vec3 end{ 2.0f * boundCenter.x - tool.tip.x, 2.0f * boundCenter.y - tool.tip.y, 2.0f * boundCenter.z - tool.tip.z };
+        tool.hold = { tool.tip.x + (end.x - tool.tip.x) * holdFraction, tool.tip.y + (end.y - tool.tip.y) * holdFraction,
+            tool.tip.z + (end.z - tool.tip.z) * holdFraction };
+        tool.side = worldToLocalDir(w.rotate, axis);
+        const Vec3 length = sub(tool.hold, tool.tip);
+        char message[256]{};
+        std::snprintf(message, sizeof(message), "  %s: tip (%.1f, %.1f, %.1f) hold (%.1f, %.1f, %.1f) length %.1f, bound radius %.1f, scale %.2f",
+            name, tool.tip.x, tool.tip.y, tool.tip.z, tool.hold.x, tool.hold.y, tool.hold.z, std::sqrt(dot(length, length)),
+            node->worldBound.radius, sc);
+        vrlockpick::runtime::logNote(message);
+        return std::sqrt(dot(length, length)) > 0.5f;
+    }
+
+    // How a hand holds a tool, in the ROCK hand frame (x along the fingers,
+    // y out of the back of the hand, z = x cross y; game units), measured
+    // from the user's 3D reference (Blender, frame 1, 70 units per metre).
+    struct HoldPose
+    {
+        Vec3 grip;     // where the fingers hold the tool
+        Vec3 toTip;    // direction from the grip to the tool's tip
+        Vec3 keyhole;  // the keyhole axis when the tool is in the lock
+    };
+    // Pin pinched between thumb and index, hanging below them.
+    constexpr HoldPose kPinHold{ { 11.6f, -6.2f, 5.3f }, { -0.106f, -0.266f, -0.958f }, { -0.781f, -0.173f, 0.600f } };
+    // Screwdriver handle in the palm, the shaft along the fingers.
+    constexpr HoldPose kScrewHold{ { 3.9f, -3.2f, 1.3f }, { 0.921f, -0.174f, -0.348f }, { -0.915f, -0.014f, -0.403f } };
+
+    // Puts a tool in the hand as in the reference: its hold point at the
+    // grip, pointing to its tip and turned so its keyhole axis matches.
+    // Returns where its tip is now, in world space.
+    Vec3 placeInHand(const Tool& tool, const HandPose& hand, const HoldPose& pose) noexcept
+    {
+        auto* node = tool.node;
+        auto& parent = *node->parent;
+        const Vec3 hx = normalized(hand.alongFingers);
+        const Vec3 hy = normalized(hand.side);
+        const Vec3 hz = cross(hx, hy);
+        const auto toWorld = [&](const Vec3& v) {
+            return Vec3{ hx.x * v.x + hy.x * v.y + hz.x * v.z, hx.y * v.x + hy.y * v.y + hz.y * v.z, hx.z * v.x + hy.z * v.y + hz.z * v.z };
+        };
+        const Vec3 offset = toWorld(pose.grip);
+        const Vec3 grip{ hand.position.x + offset.x, hand.position.y + offset.y, hand.position.z + offset.z };
+        // Matching bases: tool space (u, v, w) -> world (u2, v2, w2).
+        const Vec3 u = normalized(sub(tool.tip, tool.hold));
+        Vec3 v = sub(tool.side, { u.x * dot(tool.side, u), u.y * dot(tool.side, u), u.z * dot(tool.side, u) });
+        v = normalized(v);
+        const Vec3 w = cross(u, v);
+        const Vec3 u2 = normalized(toWorld(pose.toTip));
+        const Vec3 side = toWorld(pose.keyhole);
+        Vec3 v2 = sub(side, { u2.x * dot(side, u2), u2.y * dot(side, u2), u2.z * dot(side, u2) });
+        v2 = normalized(v2);
+        const Vec3 w2 = cross(u2, v2);
+        // World rotation, rows = tool axes in world: W[i][j] = u_i u2_j + v_i v2_j + w_i w2_j.
+        const float uu[3]{ u.x, u.y, u.z }, vv[3]{ v.x, v.y, v.z }, ww[3]{ w.x, w.y, w.z };
+        const float u2a[3]{ u2.x, u2.y, u2.z }, v2a[3]{ v2.x, v2.y, v2.z }, w2a[3]{ w2.x, w2.y, w2.z };
+        float W[3][3]{};
+        for (int i = 0; i < 3; ++i) {
+            for (int j = 0; j < 3; ++j) {
+                W[i][j] = uu[i] * u2a[j] + vv[i] * v2a[j] + ww[i] * w2a[j];
+            }
+        }
+        // Local rotation = W * P^T.
+        auto& P = parent.world.rotate;
+        auto& L = node->local.rotate;
+        for (int i = 0; i < 3; ++i) {
+            for (int j = 0; j < 3; ++j) {
+                cell(L, i, j) = W[i][0] * cell(P, j, 0) + W[i][1] * cell(P, j, 1) + W[i][2] * cell(P, j, 2);
+            }
+        }
+        // Origin so that the hold point lands on the grip: O = G - W^T (s * hold).
+        const float s = parent.world.scale * node->local.scale;
+        const float hold[3]{ tool.hold.x * s, tool.hold.y * s, tool.hold.z * s };
+        float origin[3]{ grip.x, grip.y, grip.z };
+        for (int j = 0; j < 3; ++j) {
+            origin[j] -= W[0][j] * hold[0] + W[1][j] * hold[1] + W[2][j] * hold[2];
+        }
+        // Local translation = P * (O - parent t) / parent scale.
+        const float ps = parent.world.scale > 1e-4f ? parent.world.scale : 1.0f;
+        const float d[3]{ origin[0] - parent.world.translate.x, origin[1] - parent.world.translate.y, origin[2] - parent.world.translate.z };
+        node->local.translate.x = (cell(P, 0, 0) * d[0] + cell(P, 0, 1) * d[1] + cell(P, 0, 2) * d[2]) / ps;
+        node->local.translate.y = (cell(P, 1, 0) * d[0] + cell(P, 1, 1) * d[1] + cell(P, 1, 2) * d[2]) / ps;
+        node->local.translate.z = (cell(P, 2, 0) * d[0] + cell(P, 2, 1) * d[1] + cell(P, 2, 2) * d[2]) / ps;
+        // Tip in world.
+        const float tipLocal[3]{ tool.tip.x * s, tool.tip.y * s, tool.tip.z * s };
+        Vec3 tip{ origin[0], origin[1], origin[2] };
+        tip.x += W[0][0] * tipLocal[0] + W[1][0] * tipLocal[1] + W[2][0] * tipLocal[2];
+        tip.y += W[0][1] * tipLocal[0] + W[1][1] * tipLocal[1] + W[2][1] * tipLocal[2];
+        tip.z += W[0][2] * tipLocal[0] + W[1][2] * tipLocal[1] + W[2][2] * tipLocal[2];
+        return tip;
+    }
+
+    // After the game's frame: tools not yet at the keyhole follow the hands.
+    void updateToolsInHands(RE::LockpickingMenu& menu) noexcept
+    {
+        auto& s = g_session;
+        if (!g_settings.toolsInHands || menu.animating || !s.haveBasePin) {
+            return;
+        }
+        if (!s.toolsPrepared) {
+            s.toolsPrepared = true;
+            // Hold points along the tools, from the reference.
+            s.pinDocked = !prepareTool(g_pin, g_pinNode, 0.79f, "pin");
+            s.screwDocked = !prepareTool(g_screw, g_screwNode, 0.79f, "screwdriver");
+            vrlockpick::runtime::logNote(s.pinDocked && s.screwDocked ? "Tools stay at the lock" : "Tools in the hands: bring them to the keyhole");
+        }
+        Vec3 center, axis;
+        if (!keyhole(center, axis)) {
+            return;
+        }
+        HandPose hand;
+        if (!s.pinDocked && readHand(g_settings.leftHandPick, hand)) {
+            const Vec3 tip = placeInHand(g_pin, hand, kPinHold);
+            const Vec3 d = sub(tip, center);
+            if (std::sqrt(dot(d, d)) < g_settings.dockDistance) {
+                s.pinDocked = true;
+                g_pin.node->local = g_pin.rest;
+                s.haveOrbitReference = false;
+                s.armPickAngle = 0.0f;
+                vrlockpick::runtime::logInfo("Pin in the keyhole");
+            }
+        }
+        if (!s.screwDocked && readHand(!g_settings.leftHandPick, hand)) {
+            const Vec3 tip = placeInHand(g_screw, hand, kScrewHold);
+            const Vec3 d = sub(tip, center);
+            if (std::sqrt(dot(d, d)) < g_settings.dockDistance) {
+                s.screwDocked = true;
+                g_screw.node->local = g_screw.rest;
+                s.haveWrenchOrbitReference = false;
+                s.haveTwistReference = false;
+                vrlockpick::runtime::logInfo("Screwdriver in the keyhole");
+            }
+        }
+    }
+
     // Arm control (bArmControl): pin and screwdriver.
     void armControl(RE::LockpickingMenu& menu) noexcept
     {
@@ -596,7 +798,7 @@ namespace
         // Screwdriver: the lock follows the hand, a quarter circle = 90.
         // Swinging around the keyhole (default) or twisting in place.
         const bool haveScrew = g_settings.screwTwist ? s.haveTwistReference : s.haveWrenchOrbitReference;
-        if (g_settings.turnWithHand && s.haveWrench && g_turnLock && haveScrew) {
+        if (g_settings.turnWithHand && s.haveWrench && g_turnLock && haveScrew && s.screwDocked) {
             const float target = std::fabs(g_settings.screwTwist ? s.wrenchTwist : s.wrenchOrbit) * g_settings.screwLockDegreesPerTwist;
             if (!s.handTurning && target > g_settings.armTurnStartDegrees) {
                 s.handTurning = true;
@@ -615,7 +817,7 @@ namespace
         }
 
         // Pin: held while the trigger is, moving with the hand around the keyhole.
-        if (g_settings.drivePick && s.haveHand) {
+        if (g_settings.drivePick && s.haveHand && s.pinDocked) {
             const bool trigger = !g_settings.pinNeedsTrigger || triggerHeld(g_settings.leftHandPick);
             const bool canMove = !menu.turningLock && !s.handTurning;
             if (trigger && canMove && !s.pinGrabbed) {
@@ -734,7 +936,7 @@ namespace
             auto& t = g_pinNode->local.translate;
             const bool gameMoved = !s.pinWritten || std::fabs(s.gamePinAngle - s.writtenPinAngle) > 0.2f ||
                                    std::fabs(t.x - s.writtenPinPos.x) + std::fabs(t.z - s.writtenPinPos.z) > 0.01f;
-            if (gameMoved && s.pinWritten) {
+            if (gameMoved && s.pinWritten && s.pinDocked) {
                 char message[160]{};
                 std::snprintf(message, sizeof(message), "    game moved pin: angle %.2f pos (%.3f, %.3f, %.3f)", s.gamePinAngle, t.x, t.y, t.z);
                 vrlockpick::runtime::logInfo(message);
@@ -755,6 +957,7 @@ namespace
                 s.writtenPinPos = t;
             }
         }
+        updateToolsInHands(menu);
         const bool changed = menu.turningLock != s.lastTurning || menu.picksBroken != s.lastPicksBroken;
         if (changed) {
             logMenuState(menu.picksBroken != s.lastPicksBroken ? "Pick broke" : (menu.turningLock ? "Lock turn started" : "Lock turn stopped"), menu);
