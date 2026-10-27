@@ -58,6 +58,14 @@ namespace
         // clock hand whose tip stays in the keyhole (0 = it moves by as much
         // as the hand moves around the keyhole, from where it was).
         bool pinPointsAtHand{ true };
+        // The docked screwdriver's handle follows the hand around the
+        // keyhole: down (clockwise as you look at the lock) turns the lock.
+        bool screwPointsAtHand{ true };
+        float screwSign{ 1.0f };
+        // The visible hands stay on the docked tools, like on a weapon,
+        // until the controller is this far (game units) from them.
+        bool glueHands{ true };
+        float glueMaxDistance{ 20.0f };
         // The tools start in the hands; bringing a tool's tip this close to
         // the keyhole puts it in place.
         bool toolsInHands{ true };
@@ -160,6 +168,14 @@ namespace
                     g_settings.dockDistance = value;
                 } else if (key == "bScrewTwist") {
                     g_settings.screwTwist = value != 0.0f;
+                } else if (key == "bScrewPointsAtHand") {
+                    g_settings.screwPointsAtHand = value != 0.0f;
+                } else if (key == "fScrewSign") {
+                    g_settings.screwSign = value;
+                } else if (key == "bGlueHands") {
+                    g_settings.glueHands = value != 0.0f;
+                } else if (key == "fGlueMaxDistance") {
+                    g_settings.glueMaxDistance = value;
                 } else if (key == "bPinPointsAtHand") {
                     g_settings.pinPointsAtHand = value != 0.0f;
                 } else if (key == "bPinNeedsTrigger") {
@@ -226,6 +242,8 @@ namespace
         float grabPickAngle{ 0.0f };
         float armPickAngle{ 0.0f };
         float pinchDistance{ 0.0f };
+        float screwAngle{ 0.0f };
+        bool loggedFingers{ false };
         // Screwdriver twist around the keyhole axis.
         bool haveTwistReference{ false };
         bool twistUsesFingers{ false };
@@ -625,6 +643,7 @@ namespace
         Vec3 tip;
         Vec3 hold;
         Vec3 side;  // the keyhole axis, in tool space
+        Vec3 restDir;  // tip to hold at rest, in the lock parent's space
     };
     Tool g_pin;
     Tool g_screw;
@@ -646,7 +665,30 @@ namespace
     }
 
     Vec3 sub(const Vec3& a, const Vec3& b) noexcept { return { a.x - b.x, a.y - b.y, a.z - b.z }; }
+    Vec3 add(const Vec3& a, const Vec3& b) noexcept { return { a.x + b.x, a.y + b.y, a.z + b.z }; }
+    Vec3 scaled(const Vec3& a, const float k) noexcept { return { a.x * k, a.y * k, a.z * k }; }
     Vec3 fromNi(const RE::NiPoint3& p) noexcept { return { p.x, p.y, p.z }; }
+
+    Vec3 localToWorldDir(const RE::NiMatrix3& r, const Vec3& v) noexcept
+    {
+        auto& m = const_cast<RE::NiMatrix3&>(r);
+        return {
+            cell(m, 0, 0) * v.x + cell(m, 1, 0) * v.y + cell(m, 2, 0) * v.z,
+            cell(m, 0, 1) * v.x + cell(m, 1, 1) * v.y + cell(m, 2, 1) * v.z,
+            cell(m, 0, 2) * v.x + cell(m, 1, 2) * v.y + cell(m, 2, 2) * v.z,
+        };
+    }
+
+    // A point given in a node's own space, in world space.
+    Vec3 nodePointWorld(const RE::NiAVObject& node, const Vec3& local) noexcept
+    {
+        return add(fromNi(node.world.translate), localToWorldDir(node.world.rotate, scaled(local, node.world.scale)));
+    }
+
+    Vec3 acrossOnly(const Vec3& v, const Vec3& axis) noexcept
+    {
+        return sub(v, scaled(axis, dot(v, axis)));
+    }
 
     bool prepareTool(Tool& tool, RE::NiAVObject* node, const float holdFraction, const char* name) noexcept
     {
@@ -668,6 +710,7 @@ namespace
         tool.hold = { tool.tip.x + (end.x - tool.tip.x) * holdFraction, tool.tip.y + (end.y - tool.tip.y) * holdFraction,
             tool.tip.z + (end.z - tool.tip.z) * holdFraction };
         tool.side = worldToLocalDir(w.rotate, axis);
+        tool.restDir = worldToLocalDir(g_pinNode->parent->world.rotate, localToWorldDir(w.rotate, normalized(sub(tool.hold, tool.tip))));
         const Vec3 length = sub(tool.hold, tool.tip);
         char message[256]{};
         std::snprintf(message, sizeof(message), "  %s: tip (%.1f, %.1f, %.1f) hold (%.1f, %.1f, %.1f) length %.1f, bound radius %.1f, scale %.2f",
@@ -694,7 +737,7 @@ namespace
     // Puts a tool in the hand as in the reference: its hold point at the
     // grip, pointing to its tip and turned so its keyhole axis matches.
     // Returns where its tip is now, in world space.
-    Vec3 placeInHand(const Tool& tool, const HandPose& hand, const HoldPose& pose) noexcept
+    Vec3 placeInHand(const Tool& tool, const HandPose& hand, const HoldPose& pose, const Vec3* fingers) noexcept
     {
         auto* node = tool.node;
         auto& parent = *node->parent;
@@ -705,7 +748,7 @@ namespace
             return Vec3{ hx.x * v.x + hy.x * v.y + hz.x * v.z, hx.y * v.x + hy.y * v.y + hz.y * v.z, hx.z * v.x + hy.z * v.y + hz.z * v.z };
         };
         const Vec3 offset = toWorld(pose.grip);
-        const Vec3 grip{ hand.position.x + offset.x, hand.position.y + offset.y, hand.position.z + offset.z };
+        const Vec3 grip = fingers ? *fingers : Vec3{ hand.position.x + offset.x, hand.position.y + offset.y, hand.position.z + offset.z };
         // Matching bases: tool space (u, v, w) -> world (u2, v2, w2).
         const Vec3 u = normalized(sub(tool.tip, tool.hold));
         Vec3 v = sub(tool.side, { u.x * dot(tool.side, u), u.y * dot(tool.side, u), u.z * dot(tool.side, u) });
@@ -755,6 +798,95 @@ namespace
         return tip;
     }
 
+    // ---- The visible fingers (FRIK body bones) ----
+    bool fingerBone(const bool left, const char* bone, Vec3& out) noexcept
+    {
+        char name[32]{};
+        std::snprintf(name, sizeof(name), "%sArm_%s", left ? "L" : "R", bone);
+        RE::NiTransform t;
+        if (!vrlockpick::grip::bone(name, t)) {
+            return false;
+        }
+        out = fromNi(t.translate);
+        return true;
+    }
+
+    // Where the visible fingers hold a tool: between the thumb and index
+    // tips for the pin, the middle of the curled fingers for the screwdriver.
+    bool fingerHold(const bool left, const bool pinch, Vec3& out) noexcept
+    {
+        if (pinch) {
+            Vec3 thumb2, thumb3;
+            RE::NiPoint3 index;
+            if (!fingerBone(left, "Finger12", thumb2) || !fingerBone(left, "Finger13", thumb3) || !vrlockpick::grip::indexTip(left, index)) {
+                return false;
+            }
+            // The thumb's last joint plus most of a segment more.
+            const Vec3 thumb = add(thumb3, scaled(sub(thumb3, thumb2), 0.8f));
+            out = scaled(add(thumb, fromNi(index)), 0.5f);
+            return true;
+        }
+        constexpr const char* kCurled[]{ "Finger21", "Finger22", "Finger23", "Finger31", "Finger32", "Finger33", "Finger41", "Finger42", "Finger43" };
+        Vec3 sum{};
+        for (const auto* bone : kCurled) {
+            Vec3 p;
+            if (!fingerBone(left, bone, p)) {
+                return false;
+            }
+            sum = add(sum, p);
+        }
+        out = scaled(sum, 1.0f / std::size(kCurled));
+        return true;
+    }
+
+    // Where the fingers hold a tool, from the bones or else the reference.
+    Vec3 holdPoint(const bool left, const bool pinch, const HandPose& hand, const HoldPose& pose) noexcept
+    {
+        Vec3 p;
+        if (fingerHold(left, pinch, p)) {
+            return p;
+        }
+        const Vec3 hx = normalized(hand.alongFingers);
+        const Vec3 hy = normalized(hand.side);
+        const Vec3 hz = cross(hx, hy);
+        return add(hand.position, add(scaled(hx, pose.grip.x), add(scaled(hy, pose.grip.y), scaled(hz, pose.grip.z))));
+    }
+
+    // How far the controller is from the visible hand: zero unless the hand
+    // is held on a tool. Hand input adds it, so a held hand still steers.
+    Vec3 handShift(const bool left) noexcept
+    {
+        RE::NiTransform tracked, wrist;
+        if (!vrlockpick::grip::glued(left) || !vrlockpick::grip::trackedHand(left, tracked) ||
+            !vrlockpick::grip::bone(left ? "LArm_Hand" : "RArm_Hand", wrist)) {
+            return {};
+        }
+        return sub(fromNi(tracked.translate), fromNi(wrist.translate));
+    }
+
+    // Holds the visible hand with its fingers on the tool's hold point,
+    // turned as the controller is; lets go if the controller is too far.
+    void glueHand(const bool left, const bool docked, const Tool& tool, const bool pinch, const HoldPose& pose) noexcept
+    {
+        RE::NiTransform tracked, wrist;
+        HandPose hand;
+        if (!g_settings.glueHands || !docked || !tool.node || !vrlockpick::grip::trackedHand(left, tracked) ||
+            !vrlockpick::grip::bone(left ? "LArm_Hand" : "RArm_Hand", wrist) || !readHand(left, hand)) {
+            vrlockpick::grip::unglue(left);
+            return;
+        }
+        const Vec3 fingers = sub(holdPoint(left, pinch, hand, pose), fromNi(wrist.translate));
+        const Vec3 at = sub(nodePointWorld(*tool.node, tool.hold), fingers);
+        const Vec3 pull = sub(at, fromNi(tracked.translate));
+        if (std::sqrt(dot(pull, pull)) > g_settings.glueMaxDistance) {
+            vrlockpick::grip::unglue(left);
+            return;
+        }
+        RE::NiTransform target = tracked;
+        target.translate = { at.x, at.y, at.z };
+        vrlockpick::grip::glue(left, target);
+    }
+
     // After the game's frame: tools not yet at the keyhole follow the hands.
     void updateToolsInHands(RE::LockpickingMenu& menu) noexcept
     {
@@ -774,8 +906,29 @@ namespace
             return;
         }
         HandPose hand;
+        if (!s.loggedFingers && readHand(g_settings.leftHandPick, hand)) {
+            Vec3 pinch, fist;
+            HandPose other;
+            if (fingerHold(g_settings.leftHandPick, true, pinch) && readHand(!g_settings.leftHandPick, other) &&
+                fingerHold(!g_settings.leftHandPick, false, fist)) {
+                s.loggedFingers = true;
+                const auto inHand = [](const HandPose& h, const Vec3& p) {
+                    const Vec3 hx = normalized(h.alongFingers);
+                    const Vec3 hy = normalized(h.side);
+                    const Vec3 d = sub(p, h.position);
+                    return Vec3{ dot(d, hx), dot(d, hy), dot(d, cross(hx, hy)) };
+                };
+                const Vec3 a = inHand(hand, pinch);
+                const Vec3 b = inHand(other, fist);
+                char message[200]{};
+                std::snprintf(message, sizeof(message), "  fingers in the hand frame: pinch (%.1f, %.1f, %.1f), fist (%.1f, %.1f, %.1f)", a.x, a.y, a.z, b.x, b.y, b.z);
+                vrlockpick::runtime::logNote(message);
+            }
+        }
         if (!s.pinDocked && readHand(g_settings.leftHandPick, hand)) {
-            const Vec3 tip = placeInHand(g_pin, hand, kPinHold);
+            Vec3 fingers;
+            const bool haveFingers = fingerHold(g_settings.leftHandPick, true, fingers);
+            const Vec3 tip = placeInHand(g_pin, hand, kPinHold, haveFingers ? &fingers : nullptr);
             const Vec3 d = sub(tip, center);
             if (std::sqrt(dot(d, d)) < g_settings.dockDistance) {
                 s.pinDocked = true;
@@ -786,7 +939,9 @@ namespace
             }
         }
         if (!s.screwDocked && readHand(!g_settings.leftHandPick, hand)) {
-            const Vec3 tip = placeInHand(g_screw, hand, kScrewHold);
+            Vec3 fingers;
+            const bool haveFingers = fingerHold(!g_settings.leftHandPick, false, fingers);
+            const Vec3 tip = placeInHand(g_screw, hand, kScrewHold, haveFingers ? &fingers : nullptr);
             const Vec3 d = sub(tip, center);
             if (std::sqrt(dot(d, d)) < g_settings.dockDistance) {
                 s.screwDocked = true;
@@ -811,12 +966,8 @@ namespace
         if (!g_pin.node || !g_pin.node->parent || !readHand(g_settings.leftHandPick, hand) || !keyhole(center, axis)) {
             return false;
         }
-        const Vec3 hx = normalized(hand.alongFingers);
-        const Vec3 hy = normalized(hand.side);
-        const Vec3 hz = cross(hx, hy);
-        const Vec3& g = kPinHold.grip;
-        const Vec3 fingers{ hand.position.x + hx.x * g.x + hy.x * g.y + hz.x * g.z, hand.position.y + hx.y * g.x + hy.y * g.y + hz.y * g.z,
-            hand.position.z + hx.z * g.x + hy.z * g.y + hz.z * g.z };
+        const bool left = g_settings.leftHandPick;
+        const Vec3 fingers = add(holdPoint(left, true, hand, kPinHold), handShift(left));
         Vec3 across;
         s.pinchDistance = acrossAxis(fingers, center, axis, across);
         if (s.pinchDistance < 3.0f) {
@@ -829,15 +980,42 @@ namespace
         return true;
     }
 
+    // How far the screwdriver hand has swung the handle from where the
+    // screwdriver rests, clockwise as seen from the player's side.
+    bool screwAngleTowardHand(float& angle) noexcept
+    {
+        HandPose hand;
+        Vec3 center, axis;
+        const bool left = !g_settings.leftHandPick;
+        if (!g_screw.node || !g_pinNode || !g_pinNode->parent || !readHand(left, hand) || !keyhole(center, axis)) {
+            return false;
+        }
+        const Vec3 grip = add(holdPoint(left, false, hand, kScrewHold), handShift(left));
+        Vec3 across;
+        if (acrossAxis(grip, center, axis, across) < 3.0f) {
+            return false;
+        }
+        // Positive turns are counter-clockwise looking against this axis.
+        const Vec3 view = dot(axis, sub(grip, center)) >= 0.0f ? axis : scaled(axis, -1.0f);
+        const Vec3 rest = acrossOnly(localToWorldDir(g_pinNode->parent->world.rotate, g_screw.restDir), axis);
+        if (dot(rest, rest) < 1e-4f) {
+            return false;
+        }
+        angle = -orbitDegrees(rest, across, view) * g_settings.screwSign;
+        return true;
+    }
+
     // Arm control (bArmControl): pin and screwdriver.
     void armControl(RE::LockpickingMenu& menu) noexcept
     {
         auto& s = g_session;
         // Screwdriver: the lock follows the hand, a quarter circle = 90.
         // Swinging around the keyhole (default) or twisting in place.
-        const bool haveScrew = g_settings.screwTwist ? s.haveTwistReference : s.haveWrenchOrbitReference;
+        const bool aimScrew = g_settings.screwPointsAtHand && g_settings.toolsInHands && !g_settings.screwTwist;
+        const bool haveScrew = aimScrew ? screwAngleTowardHand(s.screwAngle) : g_settings.screwTwist ? s.haveTwistReference : s.haveWrenchOrbitReference;
         if (g_settings.turnWithHand && s.haveWrench && g_turnLock && haveScrew && s.screwDocked) {
-            const float target = std::fabs(g_settings.screwTwist ? s.wrenchTwist : s.wrenchOrbit) * g_settings.screwLockDegreesPerTwist;
+            const float swung = aimScrew ? std::max(s.screwAngle, 0.0f) : std::fabs(g_settings.screwTwist ? s.wrenchTwist : s.wrenchOrbit);
+            const float target = swung * g_settings.screwLockDegreesPerTwist;
             if (!s.handTurning && target > g_settings.armTurnStartDegrees) {
                 s.handTurning = true;
                 vrlockpick::runtime::logInfo("Screwdriver twisted: lock turn on");
@@ -893,6 +1071,7 @@ namespace
         HandPose pose;
         s.haveHand = readHand(g_settings.leftHandPick, pose);
         if (s.haveHand) {
+            pose.position = add(pose.position, handShift(g_settings.leftHandPick));
             if (!s.haveReference) {
                 s.reference = pose;
                 s.haveReference = true;
@@ -903,6 +1082,7 @@ namespace
         HandPose wrench;
         s.haveWrench = readHand(!g_settings.leftHandPick, wrench);
         if (s.haveWrench) {
+            wrench.position = add(wrench.position, handShift(!g_settings.leftHandPick));
             if (!s.haveWrenchReference) {
                 s.wrenchReference = wrench;
                 s.haveWrenchReference = true;
@@ -1001,15 +1181,20 @@ namespace
             }
         }
         updateToolsInHands(menu);
+        if (g_settings.armControl && g_settings.toolsInHands && s.toolsPrepared && !menu.animating) {
+            glueHand(g_settings.leftHandPick, s.pinDocked, g_pin, true, kPinHold);
+            glueHand(!g_settings.leftHandPick, s.screwDocked, g_screw, false, kScrewHold);
+        }
         const bool changed = menu.turningLock != s.lastTurning || menu.picksBroken != s.lastPicksBroken;
         if (changed) {
             logMenuState(menu.picksBroken != s.lastPicksBroken ? "Pick broke" : (menu.turningLock ? "Lock turn started" : "Lock turn stopped"), menu);
         }
         if (now - s.lastLog > std::chrono::milliseconds(500) &&
             (std::fabs(menu.pickAngle - s.lastPickAngle) > 0.5f || std::fabs(menu.lockAngle - s.lastLockAngle) > 0.5f)) {
-            char message[256]{};
-            std::snprintf(message, sizeof(message), "  pick=%.1f gamePin=%.1f lock=%.1f handRoll=%.1f wrenchRoll=%.1f orbit=%.1f/%.1f twist=%.1f%s dist=%.1f/%.1f (hands %s/%s) sweet=%.1f+-%.1f",
-                menu.pickAngle, s.gamePinAngle, menu.lockAngle, s.handRoll, s.wrenchRoll, s.handOrbit, s.wrenchOrbit, s.wrenchTwist, s.pinGrabbed ? " held" : "", s.handDistance, s.wrenchDistance, s.haveHand ? "ok" : "missing", s.haveWrench ? "ok" : "missing",
+            char message[320]{};
+            std::snprintf(message, sizeof(message), "  pick=%.1f gamePin=%.1f lock=%.1f handRoll=%.1f wrenchRoll=%.1f orbit=%.1f/%.1f twist=%.1f screw=%.1f%s dist=%.1f/%.1f (hands %s/%s%s%s) sweet=%.1f+-%.1f",
+                menu.pickAngle, s.gamePinAngle, menu.lockAngle, s.handRoll, s.wrenchRoll, s.handOrbit, s.wrenchOrbit, s.wrenchTwist, s.screwAngle, s.pinGrabbed ? " held" : "", s.handDistance, s.wrenchDistance, s.haveHand ? "ok" : "missing", s.haveWrench ? "ok" : "missing",
+                vrlockpick::grip::glued(true) ? ", left on tool" : "", vrlockpick::grip::glued(false) ? ", right on tool" : "",
                 menu.sweetSpotCenter, menu.sweetSpotLength * 0.5f);
             vrlockpick::runtime::logInfo(message);
             s.lastLog = now;
@@ -1109,6 +1294,8 @@ namespace
                         g_session.active = false;
                         vrlockpick::grip::release(true);
                         vrlockpick::grip::release(false);
+                        vrlockpick::grip::unglue(true);
+                        vrlockpick::grip::unglue(false);
                     }
                 }
             } catch (...) {

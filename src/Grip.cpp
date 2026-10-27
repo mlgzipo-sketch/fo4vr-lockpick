@@ -96,4 +96,70 @@ namespace vrlockpick::grip
             (void)frik->clearHandPose(kTag, frikHand(left));
         }
     }
+
+    namespace
+    {
+        bool g_glued[2]{};
+        bool g_glueLogged{ false };
+
+        const FRIKApiV2* body() noexcept
+        {
+            auto* frik = api();
+            return frik && frik->getVersion() >= 3 && frik->isSkeletonReady() ? frik : nullptr;
+        }
+    }
+
+    bool bone(const char* name, RE::NiTransform& out) noexcept
+    {
+        auto* frik = body();
+        return frik && frik->getBoneWorldTransform(name, &out);
+    }
+
+    bool indexTip(const bool left, RE::NiPoint3& out) noexcept
+    {
+        auto* frik = body();
+        if (!frik) {
+            return false;
+        }
+        out = frik->getIndexFingerTipPosition(frikHand(left));
+        return true;
+    }
+
+    bool trackedHand(const bool left, RE::NiTransform& out) noexcept
+    {
+        auto* frik = body();
+        return frik && frik->getTrackedHandTransform(frikHand(left), FRIKApiV2::TrackedHandKind::FirstPersonHand, &out);
+    }
+
+    bool glue(const bool left, const RE::NiTransform& wrist) noexcept
+    {
+        auto* frik = body();
+        if (!frik) {
+            return false;
+        }
+        const bool set = frik->setHandWorldTransform(kTag, frikHand(left), wrist, kPriority);
+        g_glued[left ? 1 : 0] = set;
+        if (!g_glueLogged) {
+            g_glueLogged = true;
+            vrlockpick::runtime::logInfo(set ? "Grip: hand held on the tool" : "Grip: FRIK refused to hold the hand on the tool");
+        }
+        return set;
+    }
+
+    void unglue(const bool left) noexcept
+    {
+        const int index = left ? 1 : 0;
+        if (!g_glued[index]) {
+            return;
+        }
+        g_glued[index] = false;
+        if (auto* frik = api()) {
+            (void)frik->clearHandWorldTransform(kTag, frikHand(left));
+        }
+    }
+
+    bool glued(const bool left) noexcept
+    {
+        return g_glued[left ? 1 : 0];
+    }
 }
