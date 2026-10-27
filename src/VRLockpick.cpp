@@ -11,6 +11,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <fstream>
 #include <string>
 #include <vector>
@@ -33,6 +34,7 @@ namespace
         bool turnWithHand{ true };
         float turnStartDegrees{ 25.0f };
         float turnStopDegrees{ 15.0f };
+        float pinModelSign{ 1.0f };
     };
     Settings g_settings;
 
@@ -116,6 +118,8 @@ namespace
                     g_settings.turnWithHand = value != 0.0f;
                 } else if (key == "fTurnStartDegrees") {
                     g_settings.turnStartDegrees = value;
+                } else if (key == "fPinModelSign") {
+                    g_settings.pinModelSign = value;
                 } else if (key == "fTurnStopDegrees") {
                     g_settings.turnStopDegrees = value;
                 }
@@ -144,6 +148,7 @@ namespace
         bool handTurning{ false };
         bool pinHeld{ false };
         float heldPickAngle{ 0.0f };
+        float gamePinAngle{ 0.0f };
         std::uint64_t menuFrames{ 0 };
         std::uint64_t rockFramesAtOpen{ 0 };
         Clock::time_point lastLog{};
@@ -187,6 +192,59 @@ namespace
         float euler[3]{};
     };
     std::vector<TrackedNode> g_nodes;
+    // The node the game turns when the stick moves the pin (found in test 3).
+    RE::NiAVObject* g_pinNode{ nullptr };
+
+    // NiMatrix3 rows are NiPoint4 (x, y, z, w).
+    float& cell(RE::NiMatrix3& m, const int row, const int column) noexcept
+    {
+        return reinterpret_cast<float*>(&m)[row * 4 + column];
+    }
+
+    // LockPick01 turns about its own Y axis.
+    float pinNodeDegrees(RE::NiAVObject* node) noexcept
+    {
+        auto& m = node->local.rotate;
+        return std::atan2(cell(m, 0, 2), cell(m, 0, 0)) * 180.0f / kPi;
+    }
+
+    void setPinNodeDegrees(RE::NiAVObject* node, const float degrees) noexcept
+    {
+        const float r = degrees * kPi / 180.0f;
+        const float c = std::cos(r);
+        const float sn = std::sin(r);
+        auto& m = node->local.rotate;
+        cell(m, 0, 0) = c;   cell(m, 0, 1) = 0.0f; cell(m, 0, 2) = sn;
+        cell(m, 1, 0) = 0.0f; cell(m, 1, 1) = 1.0f; cell(m, 1, 2) = 0.0f;
+        cell(m, 2, 0) = -sn; cell(m, 2, 1) = 0.0f; cell(m, 2, 2) = c;
+    }
+
+    // The menu's floats, to find where VR keeps the pin angle the stick moves.
+    constexpr std::size_t kDumpBegin = 0xE0;
+    constexpr std::size_t kDumpEnd = 0x1C0;
+    float g_menuFloats[(kDumpEnd - kDumpBegin) / 4]{};
+    bool g_haveMenuFloats{ false };
+
+    void logChangedMenuFloats(const RE::LockpickingMenu& menu) noexcept
+    {
+        const auto* base = reinterpret_cast<const std::uint8_t*>(&menu);
+        std::string line;
+        for (std::size_t offset = kDumpBegin; offset < kDumpEnd; offset += 4) {
+            float value{};
+            std::memcpy(&value, base + offset, sizeof(value));
+            auto& previous = g_menuFloats[(offset - kDumpBegin) / 4];
+            if (g_haveMenuFloats && std::isfinite(value) && std::fabs(value) < 100000.0f && std::fabs(value - previous) > 0.5f) {
+                char item[48]{};
+                std::snprintf(item, sizeof(item), " %03zX=%.1f", offset, value);
+                line += item;
+            }
+            previous = value;
+        }
+        g_haveMenuFloats = true;
+        if (!line.empty()) {
+            vrlockpick::runtime::logInfo("    menu floats changed:" + line);
+        }
+    }
 
     void eulerDegrees(const RE::NiAVObject* object, float out[3]) noexcept
     {
@@ -203,6 +261,9 @@ namespace
             return;
         }
         TrackedNode tracked{ object, depth };
+        if (object->GetName() == "LockPick01") {
+            g_pinNode = object;
+        }
         eulerDegrees(object, tracked.euler);
         g_nodes.push_back(tracked);
         const auto name = object->GetName();
@@ -259,6 +320,8 @@ namespace
         if (auto* player = RE::PlayerCharacter::GetSingleton()) {
             logPoint("lockPickParentNode", player->vrNodes.lockPickParentNode);
             g_nodes.clear();
+            g_pinNode = nullptr;
+            g_haveMenuFloats = false;
             collectNodes(player->vrNodes.lockPickParentNode, 0);
             logPoint("primaryWand", player->vrNodes.primaryWandNode);
             logPoint("hmd", player->vrNodes.hmdNode);
@@ -348,6 +411,14 @@ namespace
     {
         auto& s = g_session;
         const auto now = Clock::now();
+        // The game has just placed the pin model from its own angle; note it,
+        // then turn the model to the hand's angle instead.
+        if (g_pinNode) {
+            s.gamePinAngle = pinNodeDegrees(g_pinNode);
+            if (g_settings.drivePick && s.haveHand && !menu.animating) {
+                setPinNodeDegrees(g_pinNode, menu.pickAngle * g_settings.pinModelSign);
+            }
+        }
         const bool changed = menu.turningLock != s.lastTurning || menu.picksBroken != s.lastPicksBroken;
         if (changed) {
             logMenuState(menu.picksBroken != s.lastPicksBroken ? "Pick broke" : (menu.turningLock ? "Lock turn started" : "Lock turn stopped"), menu);
@@ -355,14 +426,15 @@ namespace
         if (now - s.lastLog > std::chrono::milliseconds(500) &&
             (std::fabs(menu.pickAngle - s.lastPickAngle) > 0.5f || std::fabs(menu.lockAngle - s.lastLockAngle) > 0.5f)) {
             char message[256]{};
-            std::snprintf(message, sizeof(message), "  pick=%.1f lock=%.1f handRoll=%.1f wrenchRoll=%.1f (hands %s/%s) sweet=%.1f+-%.1f",
-                menu.pickAngle, menu.lockAngle, s.handRoll, s.wrenchRoll, s.haveHand ? "ok" : "missing", s.haveWrench ? "ok" : "missing",
+            std::snprintf(message, sizeof(message), "  pick=%.1f gamePin=%.1f lock=%.1f handRoll=%.1f wrenchRoll=%.1f (hands %s/%s) sweet=%.1f+-%.1f",
+                menu.pickAngle, s.gamePinAngle, menu.lockAngle, s.handRoll, s.wrenchRoll, s.haveHand ? "ok" : "missing", s.haveWrench ? "ok" : "missing",
                 menu.sweetSpotCenter, menu.sweetSpotLength * 0.5f);
             vrlockpick::runtime::logInfo(message);
             s.lastLog = now;
         }
         if (now - s.lastNodeLog > std::chrono::milliseconds(300)) {
             logTurnedNodes();
+            logChangedMenuFloats(menu);
             s.lastNodeLog = now;
         }
         s.lastPickAngle = menu.pickAngle;
