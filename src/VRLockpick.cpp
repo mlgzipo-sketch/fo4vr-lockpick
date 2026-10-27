@@ -2,6 +2,7 @@
 // The bobby pin follows the roll of one hand and the lock turns when the
 // other hand rolls like a screwdriver; the game's own rules do the rest.
 #include <ROCK/Hands.h>
+#include "Grip.h"
 #include "Runtime.h"
 
 #include <RE/Fallout.h>
@@ -42,6 +43,7 @@ namespace
         // 1 = move the hands around the keyhole (pin like a clock hand,
         // screwdriver like a lever), 0 = roll the wrists.
         bool armControl{ true };
+        bool gripFingers{ true };
         float armPickSign{ 1.0f };
         float armTurnStartDegrees{ 12.0f };
         float armTurnStopDegrees{ 6.0f };
@@ -131,6 +133,8 @@ namespace
                     g_settings.turnStartDegrees = value;
                 } else if (key == "bSetPinModel") {
                     g_settings.setPinModel = value != 0.0f;
+                } else if (key == "bGripFingers") {
+                    g_settings.gripFingers = value != 0.0f;
                 } else if (key == "bArmControl") {
                     g_settings.armControl = value != 0.0f;
                 } else if (key == "fArmPickSign") {
@@ -549,6 +553,10 @@ namespace
         if (menu.animating) {
             return;  // intro and pin-break animations
         }
+        if (g_settings.gripFingers) {
+            vrlockpick::grip::hold(g_settings.leftHandPick, true);
+            vrlockpick::grip::hold(!g_settings.leftHandPick, false);
+        }
 
         // The other hand turns the lock like a screwdriver: roll it past
         // fTurnStartDegrees to start, back under fTurnStopDegrees to let go.
@@ -726,6 +734,8 @@ namespace
                             static_cast<unsigned long long>(g_rockFrames - g_session.rockFramesAtOpen));
                         vrlockpick::runtime::logNote(message);
                         g_session.active = false;
+                        vrlockpick::grip::release(true);
+                        vrlockpick::grip::release(false);
                     }
                 }
             } catch (...) {
