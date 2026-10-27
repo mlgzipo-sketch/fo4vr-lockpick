@@ -40,6 +40,7 @@ namespace
     const hands::ApiV1* g_hands{};
     std::uint64_t g_ownerToken{ 0 };
     std::uint64_t g_rockFrames{ 0 };
+    std::uint64_t g_stickEvents{ 0 };
 
     struct Vec3
     {
@@ -400,7 +401,6 @@ namespace
     // (vtable slot 4). With bBlockStick the stick no longer reaches the menu.
     using OnThumbstick_t = void (*)(RE::BSInputEventUser*, const RE::ThumbstickEvent*);
     OnThumbstick_t g_originalOnThumbstick{ nullptr };
-    std::uint64_t g_stickEvents{ 0 };
 
     void hookedOnThumbstick(RE::BSInputEventUser* user, const RE::ThumbstickEvent* event)
     {
