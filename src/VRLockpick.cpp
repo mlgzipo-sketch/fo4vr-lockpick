@@ -54,6 +54,9 @@ namespace
         // in the fingers); the screwdriver turns like a bolt, the lock
         // following the twist (a quarter turn opens it).
         bool pinNeedsTrigger{ true };
+        // 0 = the screwdriver hand swings around the keyhole (as in the
+        // user's 3D reference), 1 = it twists in place like a bolt.
+        bool screwTwist{ false };
         float screwLockDegreesPerTwist{ 1.0f };
     };
     Settings g_settings;
@@ -143,6 +146,8 @@ namespace
                     g_settings.setPinModel = value != 0.0f;
                 } else if (key == "bGripFingers") {
                     g_settings.gripFingers = value != 0.0f;
+                } else if (key == "bScrewTwist") {
+                    g_settings.screwTwist = value != 0.0f;
                 } else if (key == "bPinNeedsTrigger") {
                     g_settings.pinNeedsTrigger = value != 0.0f;
                 } else if (key == "fScrewLockDegreesPerTwist") {
@@ -588,9 +593,11 @@ namespace
     void armControl(RE::LockpickingMenu& menu) noexcept
     {
         auto& s = g_session;
-        // Screwdriver: the lock follows the twist, a quarter turn = 90.
-        if (g_settings.turnWithHand && s.haveWrench && g_turnLock && s.haveTwistReference) {
-            const float target = std::fabs(s.wrenchTwist) * g_settings.screwLockDegreesPerTwist;
+        // Screwdriver: the lock follows the hand, a quarter circle = 90.
+        // Swinging around the keyhole (default) or twisting in place.
+        const bool haveScrew = g_settings.screwTwist ? s.haveTwistReference : s.haveWrenchOrbitReference;
+        if (g_settings.turnWithHand && s.haveWrench && g_turnLock && haveScrew) {
+            const float target = std::fabs(g_settings.screwTwist ? s.wrenchTwist : s.wrenchOrbit) * g_settings.screwLockDegreesPerTwist;
             if (!s.handTurning && target > g_settings.armTurnStartDegrees) {
                 s.handTurning = true;
                 vrlockpick::runtime::logInfo("Screwdriver twisted: lock turn on");
