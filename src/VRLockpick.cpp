@@ -13,6 +13,9 @@
 #include <cstdlib>
 #include <fstream>
 #include <string>
+#include <vector>
+#include <algorithm>
+#include <iterator>
 
 namespace
 {
@@ -28,6 +31,7 @@ namespace
         float pickDegreesPerHandDegree{ 1.0f };
         float maxPickAngle{ 90.0f };
         bool turnWithHand{ true };
+        bool blockStick{ true };
         float turnStartDegrees{ 25.0f };
         float turnStopDegrees{ 15.0f };
     };
@@ -109,6 +113,8 @@ namespace
                     g_settings.pickDegreesPerHandDegree = value;
                 } else if (key == "fMaxPickAngle") {
                     g_settings.maxPickAngle = value;
+                } else if (key == "bBlockStick") {
+                    g_settings.blockStick = value != 0.0f;
                 } else if (key == "bTurnWithHand") {
                     g_settings.turnWithHand = value != 0.0f;
                 } else if (key == "fTurnStartDegrees") {
@@ -120,8 +126,8 @@ namespace
         } catch (...) {
         }
         char message[256]{};
-        std::snprintf(message, sizeof(message), "Settings: bDrivePick=%d bLeftHandPick=%d fPickDegreesPerHandDegree=%.2f fMaxPickAngle=%.1f bTurnWithHand=%d fTurnStartDegrees=%.1f fTurnStopDegrees=%.1f",
-            g_settings.drivePick ? 1 : 0, g_settings.leftHandPick ? 1 : 0, g_settings.pickDegreesPerHandDegree, g_settings.maxPickAngle,
+        std::snprintf(message, sizeof(message), "Settings: bBlockStick=%d bDrivePick=%d bLeftHandPick=%d fPickDegreesPerHandDegree=%.2f fMaxPickAngle=%.1f bTurnWithHand=%d fTurnStartDegrees=%.1f fTurnStopDegrees=%.1f",
+            g_settings.blockStick ? 1 : 0, g_settings.drivePick ? 1 : 0, g_settings.leftHandPick ? 1 : 0, g_settings.pickDegreesPerHandDegree, g_settings.maxPickAngle,
             g_settings.turnWithHand ? 1 : 0, g_settings.turnStartDegrees, g_settings.turnStopDegrees);
         vrlockpick::runtime::logNote(message);
     }
@@ -144,6 +150,7 @@ namespace
         std::uint64_t menuFrames{ 0 };
         std::uint64_t rockFramesAtOpen{ 0 };
         Clock::time_point lastLog{};
+        Clock::time_point lastNodeLog{};
         float lastPickAngle{ 0.0f };
         float lastLockAngle{ 0.0f };
         bool lastTurning{ false };
@@ -173,6 +180,65 @@ namespace
         vrlockpick::runtime::logNote(message);
     }
 
+    // The lock and pin models hang under VRPlayerNodes::lockPickParentNode.
+    // Which node turns with the pin is not known yet, so every node there is
+    // listed when the menu opens and logged whenever its rotation changes.
+    struct TrackedNode
+    {
+        RE::NiAVObject* object{ nullptr };
+        int depth{ 0 };
+        float euler[3]{};
+    };
+    std::vector<TrackedNode> g_nodes;
+
+    void eulerDegrees(const RE::NiAVObject* object, float out[3]) noexcept
+    {
+        float x = 0.0f, y = 0.0f, z = 0.0f;
+        object->local.rotate.ToEulerAnglesXYZ(x, y, z);
+        out[0] = x * 180.0f / kPi;
+        out[1] = y * 180.0f / kPi;
+        out[2] = z * 180.0f / kPi;
+    }
+
+    void collectNodes(RE::NiAVObject* object, const int depth) noexcept
+    {
+        if (!object || depth > 8 || g_nodes.size() >= 64) {
+            return;
+        }
+        TrackedNode tracked{ object, depth };
+        eulerDegrees(object, tracked.euler);
+        g_nodes.push_back(tracked);
+        const auto name = object->GetName();
+        const auto& t = object->local.translate;
+        char message[256]{};
+        std::snprintf(message, sizeof(message), "  node %*s%.*s: local (%.1f, %.1f, %.1f) rot (%.1f, %.1f, %.1f) scale %.2f%s",
+            depth * 2, "", static_cast<int>(name.size()), name.data(), t.x, t.y, t.z,
+            tracked.euler[0], tracked.euler[1], tracked.euler[2], object->local.scale, object->IsNode() ? "" : " (geometry)");
+        vrlockpick::runtime::logNote(message);
+        if (auto* node = object->IsNode()) {
+            auto& children = node->GetRuntimeData().children;
+            for (std::uint16_t index = 0; index < children.size(); ++index) {
+                collectNodes(children[index].get(), depth + 1);
+            }
+        }
+    }
+
+    void logTurnedNodes() noexcept
+    {
+        for (auto& tracked : g_nodes) {
+            float now[3]{};
+            eulerDegrees(tracked.object, now);
+            if (std::fabs(now[0] - tracked.euler[0]) + std::fabs(now[1] - tracked.euler[1]) + std::fabs(now[2] - tracked.euler[2]) > 1.0f) {
+                const auto name = tracked.object->GetName();
+                char message[200]{};
+                std::snprintf(message, sizeof(message), "    turned: %.*s rot (%.1f, %.1f, %.1f)",
+                    static_cast<int>(name.size()), name.data(), now[0], now[1], now[2]);
+                vrlockpick::runtime::logInfo(message);
+                std::copy(std::begin(now), std::end(now), std::begin(tracked.euler));
+            }
+        }
+    }
+
     float clampPick(const float angle) noexcept
     {
         if (angle > g_settings.maxPickAngle) {
@@ -190,11 +256,14 @@ namespace
         s = Session{};
         s.active = true;
         s.rockFramesAtOpen = g_rockFrames;
+        g_stickEvents = 0;
         s.lastLog = Clock::now();
         logMenuState("Lockpicking opened", menu);
         logPoint("lockRoot", menu.lockRoot.get());
         if (auto* player = RE::PlayerCharacter::GetSingleton()) {
             logPoint("lockPickParentNode", player->vrNodes.lockPickParentNode);
+            g_nodes.clear();
+            collectNodes(player->vrNodes.lockPickParentNode, 0);
             logPoint("primaryWand", player->vrNodes.primaryWandNode);
             logPoint("hmd", player->vrNodes.hmdNode);
         }
@@ -296,6 +365,10 @@ namespace
             vrlockpick::runtime::logInfo(message);
             s.lastLog = now;
         }
+        if (now - s.lastNodeLog > std::chrono::milliseconds(300)) {
+            logTurnedNodes();
+            s.lastNodeLog = now;
+        }
         s.lastPickAngle = menu.pickAngle;
         s.lastLockAngle = menu.lockAngle;
         s.lastTurning = menu.turningLock;
@@ -323,6 +396,22 @@ namespace
         }
     }
 
+    // LockpickingMenu's BSInputEventUser part (at +0x10) gets the thumbstick
+    // (vtable slot 4). With bBlockStick the stick no longer reaches the menu.
+    using OnThumbstick_t = void (*)(RE::BSInputEventUser*, const RE::ThumbstickEvent*);
+    OnThumbstick_t g_originalOnThumbstick{ nullptr };
+    std::uint64_t g_stickEvents{ 0 };
+
+    void hookedOnThumbstick(RE::BSInputEventUser* user, const RE::ThumbstickEvent* event)
+    {
+        if (g_stickEvents++ == 0) {
+            vrlockpick::runtime::logNote(g_settings.blockStick ? "First thumbstick event in the menu: blocked" : "First thumbstick event in the menu: passed on");
+        }
+        if (!g_settings.blockStick) {
+            g_originalOnThumbstick(user, event);
+        }
+    }
+
     // The vtable is taken from the live menu, so no address library entry is needed.
     void hookMenu(RE::IMenu* menu) noexcept
     {
@@ -333,6 +422,11 @@ namespace
         g_originalAdvanceMovie = reinterpret_cast<AdvanceMovie_t>(vtable[4]);
         REL::safe_write(reinterpret_cast<std::uintptr_t>(&vtable[4]), reinterpret_cast<std::uintptr_t>(&hookedAdvanceMovie));
         vrlockpick::runtime::logNote("Hooked LockpickingMenu::AdvanceMovie");
+
+        auto* inputVtable = *reinterpret_cast<std::uintptr_t**>(reinterpret_cast<std::uintptr_t>(menu) + 0x10);
+        g_originalOnThumbstick = reinterpret_cast<OnThumbstick_t>(inputVtable[4]);
+        REL::safe_write(reinterpret_cast<std::uintptr_t>(&inputVtable[4]), reinterpret_cast<std::uintptr_t>(&hookedOnThumbstick));
+        vrlockpick::runtime::logNote("Hooked LockpickingMenu::OnThumbstickEvent");
     }
 
     class MenuWatcher final : public RE::BSTEventSink<RE::MenuOpenCloseEvent>
