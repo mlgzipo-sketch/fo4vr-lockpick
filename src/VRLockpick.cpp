@@ -35,6 +35,7 @@ namespace
         float turnStartDegrees{ 25.0f };
         float turnStopDegrees{ 15.0f };
         float pinModelSign{ 1.0f };
+        bool setPinModel{ false };
     };
     Settings g_settings;
 
@@ -118,6 +119,8 @@ namespace
                     g_settings.turnWithHand = value != 0.0f;
                 } else if (key == "fTurnStartDegrees") {
                     g_settings.turnStartDegrees = value;
+                } else if (key == "bSetPinModel") {
+                    g_settings.setPinModel = value != 0.0f;
                 } else if (key == "fPinModelSign") {
                     g_settings.pinModelSign = value;
                 } else if (key == "fTurnStopDegrees") {
@@ -411,11 +414,12 @@ namespace
     {
         auto& s = g_session;
         const auto now = Clock::now();
-        // The game has just placed the pin model from its own angle; note it,
-        // then turn the model to the hand's angle instead.
+        // The game has just placed the pin model from pickAngle; note its angle.
+        // Test 4 showed it already follows the hand, so turning the model
+        // ourselves (bSetPinModel) is off by default.
         if (g_pinNode) {
             s.gamePinAngle = pinNodeDegrees(g_pinNode);
-            if (g_settings.drivePick && s.haveHand && !menu.animating) {
+            if (g_settings.setPinModel && g_settings.drivePick && s.haveHand && !menu.animating) {
                 setPinNodeDegrees(g_pinNode, menu.pickAngle * g_settings.pinModelSign);
             }
         }
