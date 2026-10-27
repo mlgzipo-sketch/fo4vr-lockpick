@@ -6,6 +6,8 @@
 
 #include <RE/Fallout.h>
 #include <REL/Relocation.h>
+#include <REX/W32/OLE32.h>
+#include <REX/W32/SHELL32.h>
 
 #include <chrono>
 #include <cmath>
@@ -13,7 +15,9 @@
 #include <cstdlib>
 #include <cstddef>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
+#include <memory>
 #include <string>
 #include <vector>
 #include <algorithm>
@@ -44,6 +48,7 @@ namespace
         std::string turnEvent{ "RotateLock" };
         bool sendTurnEvents{ true };
         bool forceTurningFlag{ false };
+        bool dumpGameCode{ true };
     };
     Settings g_settings;
 
@@ -142,6 +147,8 @@ namespace
                     }
                 } else if (key == "bSendTurnEvents") {
                     g_settings.sendTurnEvents = value != 0.0f;
+                } else if (key == "bDumpGameCode") {
+                    g_settings.dumpGameCode = value != 0.0f;
                 } else if (key == "bForceTurningFlag") {
                     g_settings.forceTurningFlag = value != 0.0f;
                 } else if (key == "fPinModelSign") {
@@ -467,6 +474,34 @@ namespace
     static_assert(offsetof(FakeInputEvent, value0) == 0x38);
     static_assert(sizeof(FakeInputEvent) == 0x48);
 
+    // The exe on disk is encrypted (Steam), so the game's code is read from
+    // memory once and saved next to the log, to find how VR lockpicking reads
+    // the turn stick. Only the code section; written only if not there yet.
+    void dumpGameCode() noexcept
+    {
+        try {
+            wchar_t* documents{ nullptr };
+            const auto result = REX::W32::SHGetKnownFolderPath(
+                REX::W32::FOLDERID_Documents, REX::W32::KF_FLAG_DEFAULT, nullptr, std::addressof(documents));
+            std::unique_ptr<wchar_t[], decltype(&REX::W32::CoTaskMemFree)> documentsPath(documents, REX::W32::CoTaskMemFree);
+            if (!documentsPath || result != 0) {
+                return;
+            }
+            const auto path = std::filesystem::path(documentsPath.get()) / "My Games" / "Fallout4VR" / "F4SE" / "VRLockpick_code.bin";
+            if (std::filesystem::exists(path)) {
+                return;
+            }
+            const auto& module = REL::Module::get();
+            const auto text = module.segment(REL::Segment::text);
+            std::ofstream file(path, std::ios::binary | std::ios::trunc);
+            file.write(static_cast<const char*>(text.pointer()), static_cast<std::streamsize>(text.size()));
+            char message[200]{};
+            std::snprintf(message, sizeof(message), "Saved the game's code section for analysis: rva 0x%zX, 0x%zX bytes", text.offset(), text.size());
+            vrlockpick::runtime::logNote(message);
+        } catch (...) {
+        }
+    }
+
     void* fakeDestructor(void* self, std::uint32_t) noexcept { return self; }
     std::uintptr_t fakeNothing(const void*) noexcept { return 0; }
     bool fakeHasIDCode(const void*) noexcept { return true; }
@@ -482,6 +517,8 @@ namespace
         reinterpret_cast<const void*>(&fakeNothing),
     };
 
+    using ShouldHandle_t = bool (*)(RE::BSInputEventUser*, const RE::InputEvent*);
+    ShouldHandle_t g_originalShouldHandle{ nullptr };
     using OnButton_t = void (*)(RE::BSInputEventUser*, const RE::ButtonEvent*);
     using OnThumbstick_t = void (*)(RE::BSInputEventUser*, const RE::ThumbstickEvent*);
     OnButton_t g_originalOnButton{ nullptr };
@@ -562,6 +599,36 @@ namespace
             g_lastRealPress = input;
             g_lastRealPressTime = Clock::now();
         }
+    }
+
+    // Logs which input reaches the menu at all (test 7: no event handler ran).
+    bool hookedShouldHandle(RE::BSInputEventUser* user, const RE::InputEvent* event)
+    {
+        const bool result = g_originalShouldHandle(user, event);
+        try {
+            static int logged = 0;
+            if (event && logged < 60) {
+                ++logged;
+                // Button, cursor and thumbstick events carry a user event name
+                // (no virtual call: VR's vtables may not match the headers).
+                const auto type = event->eventType.get();
+                const bool hasId = type == RE::INPUT_EVENT_TYPE::kButton || type == RE::INPUT_EVENT_TYPE::kCursorMove ||
+                                   type == RE::INPUT_EVENT_TYPE::kThumbstick;
+                const auto* id = hasId ? static_cast<const RE::IDEvent*>(event) : nullptr;
+                std::string name;
+                if (id) {
+                    const auto raw = id->QRawUserEvent();
+                    name.assign(raw.data(), raw.size());
+                }
+                char message[200]{};
+                std::snprintf(message, sizeof(message), "  input offered: type=%d '%s' id=0x%X device=%d -> %s",
+                    static_cast<int>(event->eventType.underlying()), name.c_str(), id ? static_cast<unsigned>(id->idCode) : 0u,
+                    static_cast<int>(event->device.underlying()), result ? "handled" : "ignored");
+                vrlockpick::runtime::logInfo(message);
+            }
+        } catch (...) {
+        }
+        return result;
     }
 
     void hookedOnButton(RE::BSInputEventUser* user, const RE::ButtonEvent* event)
@@ -850,6 +917,8 @@ namespace
             return;
         }
         auto* inputVtable = *reinterpret_cast<std::uintptr_t**>(user);
+        g_originalShouldHandle = reinterpret_cast<ShouldHandle_t>(inputVtable[1]);
+        REL::safe_write(reinterpret_cast<std::uintptr_t>(&inputVtable[1]), reinterpret_cast<std::uintptr_t>(&hookedShouldHandle));
         g_originalOnThumbstick = reinterpret_cast<OnThumbstick_t>(inputVtable[4]);
         g_originalOnButton = reinterpret_cast<OnButton_t>(inputVtable[8]);
         REL::safe_write(reinterpret_cast<std::uintptr_t>(&inputVtable[4]), reinterpret_cast<std::uintptr_t>(&hookedOnThumbstick));
@@ -909,6 +978,9 @@ namespace
         if (!ready) {
             readSettings();
             loadTurnInput();
+            if (g_settings.dumpGameCode) {
+                dumpGameCode();
+            }
             if (auto* ui = RE::UI::GetSingleton()) {
                 ui->RegisterSink<RE::MenuOpenCloseEvent>(&g_menuWatcher);
                 vrlockpick::runtime::logNote("Watching for the lockpicking menu (build " VRLOCKPICK_BUILD ")");
