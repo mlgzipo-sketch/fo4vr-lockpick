@@ -6,18 +6,13 @@
 
 #include <RE/Fallout.h>
 #include <REL/Relocation.h>
-#include <REX/W32/OLE32.h>
-#include <REX/W32/SHELL32.h>
 
 #include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
-#include <cstddef>
 #include <cstring>
-#include <filesystem>
 #include <fstream>
-#include <memory>
 #include <string>
 #include <vector>
 #include <algorithm>
@@ -41,14 +36,9 @@ namespace
         float turnStopDegrees{ 15.0f };
         float pinModelSign{ 1.0f };
         bool setPinModel{ true };
-        // Lock turning goes through the menu's own input handler: a turn
-        // event is sent as if the game's turn button were held. It is the
-        // one the game used last time (learned, saved in VRLockpick_turn.txt)
-        // or, until then, a button event with this name.
-        std::string turnEvent{ "RotateLock" };
-        bool sendTurnEvents{ true };
-        bool forceTurningFlag{ false };
-        bool dumpGameCode{ true };
+        // Hand roll at which the lock turns at full speed (like the stick
+        // pushed all the way); less roll turns it slower.
+        float turnFullDegrees{ 60.0f };
     };
     Settings g_settings;
 
@@ -119,14 +109,7 @@ namespace
                 while (!key.empty() && (key.back() == ' ' || key.back() == '\t')) {
                     key.pop_back();
                 }
-                auto text = line.substr(equals + 1);
-                while (!text.empty() && (text.back() == ' ' || text.back() == '\t' || text.back() == '\r')) {
-                    text.pop_back();
-                }
-                while (!text.empty() && (text.front() == ' ' || text.front() == '\t')) {
-                    text.erase(text.begin());
-                }
-                const float value = std::strtof(text.c_str(), nullptr);
+                const float value = std::strtof(line.c_str() + equals + 1, nullptr);
                 if (key == "bDrivePick") {
                     g_settings.drivePick = value != 0.0f;
                 } else if (key == "bLeftHandPick") {
@@ -141,16 +124,8 @@ namespace
                     g_settings.turnStartDegrees = value;
                 } else if (key == "bSetPinModel") {
                     g_settings.setPinModel = value != 0.0f;
-                } else if (key == "sTurnEvent") {
-                    if (!text.empty()) {
-                        g_settings.turnEvent = text;
-                    }
-                } else if (key == "bSendTurnEvents") {
-                    g_settings.sendTurnEvents = value != 0.0f;
-                } else if (key == "bDumpGameCode") {
-                    g_settings.dumpGameCode = value != 0.0f;
-                } else if (key == "bForceTurningFlag") {
-                    g_settings.forceTurningFlag = value != 0.0f;
+                } else if (key == "fTurnFullDegrees") {
+                    g_settings.turnFullDegrees = value;
                 } else if (key == "fPinModelSign") {
                     g_settings.pinModelSign = value;
                 } else if (key == "fTurnStopDegrees") {
@@ -159,11 +134,10 @@ namespace
             }
         } catch (...) {
         }
-        char message[384]{};
-        std::snprintf(message, sizeof(message), "Settings: bDrivePick=%d bLeftHandPick=%d fPickDegreesPerHandDegree=%.2f fMaxPickAngle=%.1f bTurnWithHand=%d fTurnStartDegrees=%.1f fTurnStopDegrees=%.1f bSendTurnEvents=%d sTurnEvent=%s bForceTurningFlag=%d",
+        char message[256]{};
+        std::snprintf(message, sizeof(message), "Settings: bDrivePick=%d bLeftHandPick=%d fPickDegreesPerHandDegree=%.2f fMaxPickAngle=%.1f bTurnWithHand=%d fTurnStartDegrees=%.1f fTurnStopDegrees=%.1f fTurnFullDegrees=%.1f",
             g_settings.drivePick ? 1 : 0, g_settings.leftHandPick ? 1 : 0, g_settings.pickDegreesPerHandDegree, g_settings.maxPickAngle,
-            g_settings.turnWithHand ? 1 : 0, g_settings.turnStartDegrees, g_settings.turnStopDegrees, g_settings.sendTurnEvents ? 1 : 0,
-            g_settings.turnEvent.c_str(), g_settings.forceTurningFlag ? 1 : 0);
+            g_settings.turnWithHand ? 1 : 0, g_settings.turnStartDegrees, g_settings.turnStopDegrees, g_settings.turnFullDegrees);
         vrlockpick::runtime::logNote(message);
     }
 
@@ -180,9 +154,6 @@ namespace
         float handRoll{ 0.0f };
         float wrenchRoll{ 0.0f };
         bool handTurning{ false };
-        float turnHeldSecs{ 0.0f };
-        bool sentTurn{ false };
-        Clock::time_point lastRealPress{};
         bool pinHeld{ false };
         float heldPickAngle{ 0.0f };
         float gamePinAngle{ 0.0f };
@@ -393,309 +364,26 @@ namespace
         return angle;
     }
 
-    // ---- Lock turn through the menu's input handler ----
-    // Setting turningLock alone doesn't turn the lock: the game computes the
-    // damage angle and starts the turn only when its turn input arrives
-    // (test 6). So the screwdriver hand sends that input, as if held.
+    // The game's own lock turn (VR, found in the code saved in test 8): the
+    // menu's thumbstick handler calls it with the turn stick's x every
+    // frame; x != 0 starts the turn (damage angle, sound) and turns the lock
+    // by |x|, x == 0 lets go. Called the same way for the screwdriver hand.
+    // Only used if the code there is exactly what was analysed.
+    using TurnLock_t = void (*)(RE::LockpickingMenu*, float);
+    constexpr std::uintptr_t kTurnLockOffset = 0x131DF10;
+    constexpr std::uint8_t kTurnLockBytes[]{ 0x40, 0x53, 0x48, 0x83, 0xEC, 0x40, 0x0F, 0x29, 0x74, 0x24, 0x30,
+        0x0F, 0x29, 0x7C, 0x24, 0x20, 0x0F, 0x57, 0xFF, 0x48, 0x8B, 0xD9, 0x0F, 0x28 };
+    TurnLock_t g_turnLock{ nullptr };
 
-    struct TurnInput
+    void findTurnLock() noexcept
     {
-        bool valid{ false };
-        bool thumbstick{ false };
-        std::int32_t device{ static_cast<std::int32_t>(RE::INPUT_DEVICE::kGamepad) };
-        std::int32_t deviceID{ 0 };
-        std::int32_t idCode{ -1 };
-        std::string name;
-        float x{ 0.0f };
-        float y{ 0.0f };
-    };
-    TurnInput g_turnInput;      // learned from the game's own turn, if any
-    TurnInput g_lastRealPress;  // the latest real press, learned when a turn follows it
-    Clock::time_point g_lastRealPressTime{};
-    constexpr const char* kTurnFile = "Data/F4SE/Plugins/VRLockpick_turn.txt";
-
-    void describeTurnInput(const char* label, const TurnInput& input) noexcept
-    {
-        char message[256]{};
-        std::snprintf(message, sizeof(message), "%s: %s '%s' id=0x%X device=%d/%d xy=(%.2f, %.2f)", label,
-            input.thumbstick ? "thumbstick" : "button", input.name.c_str(), static_cast<unsigned>(input.idCode),
-            input.device, input.deviceID, input.x, input.y);
-        vrlockpick::runtime::logNote(message);
-    }
-
-    void saveTurnInput() noexcept
-    {
-        try {
-            std::ofstream file(kTurnFile, std::ios::trunc);
-            file << (g_turnInput.thumbstick ? 1 : 0) << ' ' << g_turnInput.device << ' ' << g_turnInput.deviceID << ' '
-                 << g_turnInput.idCode << ' ' << g_turnInput.x << ' ' << g_turnInput.y << ' ' << g_turnInput.name << '\n';
-        } catch (...) {
-        }
-    }
-
-    void loadTurnInput() noexcept
-    {
-        try {
-            std::ifstream file(kTurnFile);
-            int thumbstick = 0;
-            TurnInput input;
-            if (file >> thumbstick >> input.device >> input.deviceID >> input.idCode >> input.x >> input.y >> input.name && !input.name.empty()) {
-                input.thumbstick = thumbstick != 0;
-                input.valid = true;
-                g_turnInput = input;
-                describeTurnInput("Turn input from the last game", g_turnInput);
-            }
-        } catch (...) {
-        }
-    }
-
-    // A ButtonEvent/ThumbstickEvent the game can read. Its vtable is ours, so
-    // nothing depends on the game's event vtables.
-    struct FakeInputEvent
-    {
-        const void* const* vtable{ nullptr };
-        std::int32_t device{ 0 };
-        std::int32_t deviceID{ 0 };
-        std::int32_t eventType{ 0 };
-        std::int32_t pad14{ 0 };
-        void* next{ nullptr };
-        std::uint32_t timeCode{ static_cast<std::uint32_t>(-1) };
-        std::int32_t handled{ 0 };
-        RE::BSFixedString userEvent;  // 28
-        std::int32_t idCode{ -1 };    // 30
-        bool disabled{ false };       // 34
-        float value0{ 0.0f };         // 38: value / xValue
-        float value1{ 0.0f };         // 3C: heldDownSecs / yValue
-        std::int32_t value2{ 0 };     // 40: prevDir
-        std::int32_t value3{ 0 };     // 44: currDir
-    };
-    static_assert(sizeof(RE::BSFixedString) == 8);
-    static_assert(offsetof(FakeInputEvent, userEvent) == 0x28);
-    static_assert(offsetof(FakeInputEvent, value0) == 0x38);
-    static_assert(sizeof(FakeInputEvent) == 0x48);
-
-    // The exe on disk is encrypted (Steam), so the game's code is read from
-    // memory once and saved next to the log, to find how VR lockpicking reads
-    // the turn stick. Only the code section; written only if not there yet.
-    void dumpGameCode() noexcept
-    {
-        try {
-            wchar_t* documents{ nullptr };
-            const auto result = REX::W32::SHGetKnownFolderPath(
-                REX::W32::FOLDERID_Documents, REX::W32::KF_FLAG_DEFAULT, nullptr, std::addressof(documents));
-            std::unique_ptr<wchar_t[], decltype(&REX::W32::CoTaskMemFree)> documentsPath(documents, REX::W32::CoTaskMemFree);
-            if (!documentsPath || result != 0) {
-                return;
-            }
-            const auto path = std::filesystem::path(documentsPath.get()) / "My Games" / "Fallout4VR" / "F4SE" / "VRLockpick_code.bin";
-            if (std::filesystem::exists(path)) {
-                return;
-            }
-            const auto& module = REL::Module::get();
-            const auto text = module.segment(REL::Segment::text);
-            std::ofstream file(path, std::ios::binary | std::ios::trunc);
-            file.write(static_cast<const char*>(text.pointer()), static_cast<std::streamsize>(text.size()));
-            char message[200]{};
-            std::snprintf(message, sizeof(message), "Saved the game's code section for analysis: rva 0x%zX, 0x%zX bytes", text.offset(), text.size());
-            vrlockpick::runtime::logNote(message);
-        } catch (...) {
-        }
-    }
-
-    void* fakeDestructor(void* self, std::uint32_t) noexcept { return self; }
-    std::uintptr_t fakeNothing(const void*) noexcept { return 0; }
-    bool fakeHasIDCode(const void*) noexcept { return true; }
-    const RE::BSFixedString* fakeUserEvent(const FakeInputEvent* self) noexcept { return &self->userEvent; }
-    const void* const kFakeVtable[8]{
-        reinterpret_cast<const void*>(&fakeDestructor),
-        reinterpret_cast<const void*>(&fakeNothing),
-        reinterpret_cast<const void*>(&fakeHasIDCode),
-        reinterpret_cast<const void*>(&fakeUserEvent),
-        reinterpret_cast<const void*>(&fakeNothing),
-        reinterpret_cast<const void*>(&fakeNothing),
-        reinterpret_cast<const void*>(&fakeNothing),
-        reinterpret_cast<const void*>(&fakeNothing),
-    };
-
-    using ShouldHandle_t = bool (*)(RE::BSInputEventUser*, const RE::InputEvent*);
-    ShouldHandle_t g_originalShouldHandle{ nullptr };
-    using OnButton_t = void (*)(RE::BSInputEventUser*, const RE::ButtonEvent*);
-    using OnThumbstick_t = void (*)(RE::BSInputEventUser*, const RE::ThumbstickEvent*);
-    OnButton_t g_originalOnButton{ nullptr };
-    OnThumbstick_t g_originalOnThumbstick{ nullptr };
-    RE::BSInputEventUser* g_inputUser{ nullptr };
-    bool g_warnedNoInput{ false };
-
-    RE::LockpickingMenu* menuFromInputUser(RE::BSInputEventUser* user) noexcept
-    {
-        return static_cast<RE::LockpickingMenu*>(static_cast<RE::IMenu*>(user));
-    }
-
-    // Sends the turn input: down=true while the hand is turned (heldSecs
-    // grows like a held button), down=false once to let go.
-    void sendTurn(const bool down, const float heldSecs) noexcept
-    {
-        if (!g_inputUser || !g_originalOnButton || !g_originalOnThumbstick) {
-            if (!g_warnedNoInput) {
-                vrlockpick::runtime::logWarning("Menu input not hooked; the hand can't send the turn input");
-                g_warnedNoInput = true;
-            }
-            return;
-        }
-        FakeInputEvent event;
-        event.vtable = kFakeVtable;
-        const bool learned = g_turnInput.valid;
-        event.device = g_turnInput.device;
-        event.deviceID = g_turnInput.deviceID;
-        event.idCode = learned ? g_turnInput.idCode : -1;
-        event.userEvent = learned ? g_turnInput.name.c_str() : g_settings.turnEvent.c_str();
-        if (learned && g_turnInput.thumbstick) {
-            event.eventType = static_cast<std::int32_t>(RE::INPUT_EVENT_TYPE::kThumbstick);
-            event.value0 = down ? g_turnInput.x : 0.0f;
-            event.value1 = down ? g_turnInput.y : 0.0f;
-            g_originalOnThumbstick(g_inputUser, reinterpret_cast<const RE::ThumbstickEvent*>(&event));
+        const auto address = REL::Module::get().base() + kTurnLockOffset;
+        if (std::memcmp(reinterpret_cast<const void*>(address), kTurnLockBytes, sizeof(kTurnLockBytes)) == 0) {
+            g_turnLock = reinterpret_cast<TurnLock_t>(address);
+            vrlockpick::runtime::logNote("Found the game's lock turn function");
         } else {
-            event.eventType = static_cast<std::int32_t>(RE::INPUT_EVENT_TYPE::kButton);
-            event.value0 = down ? 1.0f : 0.0f;
-            event.value1 = heldSecs;
-            g_originalOnButton(g_inputUser, reinterpret_cast<const RE::ButtonEvent*>(&event));
+            vrlockpick::runtime::logWarning("The game's lock turn function is not where expected (other game version?); the hand can't turn the lock");
         }
-    }
-
-    void learnTurnInput(const TurnInput& input) noexcept
-    {
-        const bool same = g_turnInput.valid && g_turnInput.thumbstick == input.thumbstick &&
-                          g_turnInput.name == input.name && g_turnInput.idCode == input.idCode;
-        if (!same) {
-            g_turnInput = input;
-            saveTurnInput();
-            describeTurnInput("Learned the game's turn input", g_turnInput);
-        }
-    }
-
-    // Remembers a real press; if the game started a turn while handling it,
-    // that press is the turn input.
-    void rememberRealPress(const RE::IDEvent& event, const bool thumbstick, const float x, const float y, const bool startedTurn) noexcept
-    {
-        TurnInput input;
-        input.valid = true;
-        input.thumbstick = thumbstick;
-        input.device = static_cast<std::int32_t>(event.device.underlying());
-        input.deviceID = event.deviceID;
-        input.idCode = event.idCode;
-        const auto name = event.QRawUserEvent();
-        input.name.assign(name.data(), name.size());
-        input.x = x;
-        input.y = y;
-        if (input.name.empty()) {
-            return;
-        }
-        if (startedTurn) {
-            learnTurnInput(input);
-        }
-        // The left stick moves the pin all the time; only other inputs are
-        // candidates for a turn the game starts a frame later.
-        if (!thumbstick || event.idCode == RE::ThumbstickEvent::kRight) {
-            g_lastRealPress = input;
-            g_lastRealPressTime = Clock::now();
-        }
-    }
-
-    // Logs which input reaches the menu at all (test 7: no event handler ran).
-    bool hookedShouldHandle(RE::BSInputEventUser* user, const RE::InputEvent* event)
-    {
-        const bool result = g_originalShouldHandle(user, event);
-        try {
-            static int logged = 0;
-            if (event && logged < 60) {
-                ++logged;
-                // Button, cursor and thumbstick events carry a user event name
-                // (no virtual call: VR's vtables may not match the headers).
-                const auto type = event->eventType.get();
-                const bool hasId = type == RE::INPUT_EVENT_TYPE::kButton || type == RE::INPUT_EVENT_TYPE::kCursorMove ||
-                                   type == RE::INPUT_EVENT_TYPE::kThumbstick;
-                const auto* id = hasId ? static_cast<const RE::IDEvent*>(event) : nullptr;
-                std::string name;
-                if (id) {
-                    const auto raw = id->QRawUserEvent();
-                    name.assign(raw.data(), raw.size());
-                }
-                char message[200]{};
-                std::snprintf(message, sizeof(message), "  input offered: type=%d '%s' id=0x%X device=%d -> %s",
-                    static_cast<int>(event->eventType.underlying()), name.c_str(), id ? static_cast<unsigned>(id->idCode) : 0u,
-                    static_cast<int>(event->device.underlying()), result ? "handled" : "ignored");
-                vrlockpick::runtime::logInfo(message);
-            }
-        } catch (...) {
-        }
-        return result;
-    }
-
-    void hookedOnButton(RE::BSInputEventUser* user, const RE::ButtonEvent* event)
-    {
-        auto* menu = menuFromInputUser(user);
-        const bool turningBefore = menu->turningLock;
-        g_originalOnButton(user, event);
-        try {
-            if (event && (event->value == 0.0f || event->heldDownSecs == 0.0f)) {
-                const auto name = event->QRawUserEvent();
-                char message[256]{};
-                std::snprintf(message, sizeof(message), "  input: button '%.*s' id=0x%X device=%d/%d value=%.2f held=%.2f turning %d->%d",
-                    static_cast<int>(name.size()), name.data(), static_cast<unsigned>(event->idCode),
-                    static_cast<int>(event->device.underlying()), event->deviceID, event->value, event->heldDownSecs,
-                    turningBefore ? 1 : 0, menu->turningLock ? 1 : 0);
-                vrlockpick::runtime::logInfo(message);
-                if (event->value != 0.0f) {
-                    rememberRealPress(*event, false, 0.0f, 0.0f, !turningBefore && menu->turningLock);
-                }
-            }
-        } catch (...) {
-        }
-    }
-
-    void hookedOnThumbstick(RE::BSInputEventUser* user, const RE::ThumbstickEvent* event)
-    {
-        auto* menu = menuFromInputUser(user);
-        const bool turningBefore = menu->turningLock;
-        g_originalOnThumbstick(user, event);
-        try {
-            if (event) {
-                static bool wasPushed[2]{};
-                const int stick = event->idCode == RE::ThumbstickEvent::kRight ? 1 : 0;
-                const bool pushed = event->xValue * event->xValue + event->yValue * event->yValue > 0.25f;
-                if (pushed != wasPushed[stick]) {
-                    const auto name = event->QRawUserEvent();
-                    char message[256]{};
-                    std::snprintf(message, sizeof(message), "  input: thumbstick '%.*s' id=0x%X device=%d/%d xy=(%.2f, %.2f) turning %d->%d",
-                        static_cast<int>(name.size()), name.data(), static_cast<unsigned>(event->idCode),
-                        static_cast<int>(event->device.underlying()), event->deviceID, event->xValue, event->yValue,
-                        turningBefore ? 1 : 0, menu->turningLock ? 1 : 0);
-                    vrlockpick::runtime::logInfo(message);
-                    wasPushed[stick] = pushed;
-                }
-                if (pushed) {
-                    rememberRealPress(*event, true, event->xValue, event->yValue, !turningBefore && menu->turningLock);
-                }
-            }
-        } catch (...) {
-        }
-    }
-
-    // MSVC RTTI: vtable[-1] is the Complete Object Locator, which names the
-    // class and the subobject's offset; checked before any slot is patched.
-    bool vtableIs(const void* object, const std::uint32_t offset, const char* className) noexcept
-    {
-        const auto* vtable = *reinterpret_cast<const std::uintptr_t* const*>(object);
-        const auto* locator = reinterpret_cast<const std::uint32_t*>(vtable[-1]);
-        if (!locator || locator[0] != 1 || locator[1] != offset) {
-            return false;
-        }
-        const auto imageBase = reinterpret_cast<std::uintptr_t>(locator) - locator[5];
-        const char* name = reinterpret_cast<const char*>(imageBase + locator[3] + 0x10);
-        char message[200]{};
-        std::snprintf(message, sizeof(message), "  RTTI at +0x%X: %.120s", offset, name);
-        vrlockpick::runtime::logNote(message);
-        return std::strstr(name, className) != nullptr;
     }
 
     void openSession(RE::LockpickingMenu& menu) noexcept
@@ -731,7 +419,7 @@ namespace
 
     // Runs before the game's AdvanceMovie, so the game moves the pin model,
     // checks the sweet spot and turns the lock with our values, not the stick's.
-    void beforeAdvance(RE::LockpickingMenu& menu, const float timeDelta) noexcept
+    void beforeAdvance(RE::LockpickingMenu& menu) noexcept
     {
         auto& s = g_session;
         if (!s.active) {
@@ -764,36 +452,23 @@ namespace
 
         // The other hand turns the lock like a screwdriver: roll it past
         // fTurnStartDegrees to start, back under fTurnStopDegrees to let go.
-        // While it is turned the game's turn input is sent every frame, as
-        // if the button were held; when it is not, the real button still works.
-        if (g_settings.turnWithHand && s.haveWrench) {
+        // While turned, the game's turn function gets a stick-like strength
+        // every frame (more roll, faster); when the hand is not turned it is
+        // left alone and the stick still works.
+        if (g_settings.turnWithHand && s.haveWrench && g_turnLock) {
             const float roll = std::fabs(s.wrenchRoll);
             if (!s.handTurning && roll > g_settings.turnStartDegrees) {
                 s.handTurning = true;
-                s.turnHeldSecs = 0.0f;
                 vrlockpick::runtime::logInfo(s.wrenchRoll > 0.0f ? "Wrench hand turned (+): lock turn on" : "Wrench hand turned (-): lock turn on");
-                if (g_settings.sendTurnEvents) {
-                    sendTurn(true, 0.0f);
-                    s.sentTurn = true;
-                }
             } else if (s.handTurning && roll < g_settings.turnStopDegrees) {
                 s.handTurning = false;
+                g_turnLock(&menu, 0.0f);
                 vrlockpick::runtime::logInfo("Wrench hand back: lock turn off");
-                if (s.sentTurn) {
-                    sendTurn(false, s.turnHeldSecs);
-                    s.sentTurn = false;
-                }
-                if (g_settings.forceTurningFlag) {
-                    menu.turningLock = false;
-                }
-            } else if (s.handTurning) {
-                s.turnHeldSecs += timeDelta > 0.0f ? timeDelta : 0.011f;
-                if (s.sentTurn) {
-                    sendTurn(true, s.turnHeldSecs);
-                }
             }
-            if (s.handTurning && g_settings.forceTurningFlag) {
-                menu.turningLock = true;
+            if (s.handTurning) {
+                const float full = std::max(g_settings.turnFullDegrees, g_settings.turnStartDegrees + 1.0f);
+                const float strength = std::clamp(roll / full, 0.3f, 1.0f);
+                g_turnLock(&menu, strength);
             }
         }
 
@@ -845,12 +520,6 @@ namespace
                 s.writtenPinPos = t;
             }
         }
-        // The game started a turn of its own: remember the input that did it,
-        // so the hand sends exactly that from now on.
-        if (menu.turningLock && !s.lastTurning && !s.sentTurn && g_lastRealPress.valid &&
-            now - g_lastRealPressTime < std::chrono::milliseconds(500)) {
-            learnTurnInput(g_lastRealPress);
-        }
         const bool changed = menu.turningLock != s.lastTurning || menu.picksBroken != s.lastPicksBroken;
         if (changed) {
             logMenuState(menu.picksBroken != s.lastPicksBroken ? "Pick broke" : (menu.turningLock ? "Lock turn started" : "Lock turn stopped"), menu);
@@ -883,7 +552,7 @@ namespace
     {
         if (menu) {
             try {
-                beforeAdvance(*menu, timeDelta);
+                beforeAdvance(*menu);
             } catch (...) {
             }
         }
@@ -894,6 +563,22 @@ namespace
             } catch (...) {
             }
         }
+    }
+
+    // VR's thumbstick handler for the menu (slot 7 of its input vtable at
+    // +0x10; VR has one more input slot than the flat game). The idle turn
+    // stick sends x = 0 every frame, which would let go of the hand's turn,
+    // so stick events are skipped while the hand is turning.
+    using OnThumbstick_t = void (*)(void*, void*);
+    OnThumbstick_t g_originalOnThumbstick{ nullptr };
+    constexpr std::uintptr_t kOnThumbstickOffset = 0x131BA00;
+
+    void hookedOnThumbstick(void* user, void* event)
+    {
+        if (g_session.active && g_session.handTurning) {
+            return;
+        }
+        g_originalOnThumbstick(user, event);
     }
 
     // The vtable is taken from the live menu, so no address library entry is needed.
@@ -907,23 +592,14 @@ namespace
         REL::safe_write(reinterpret_cast<std::uintptr_t>(&vtable[4]), reinterpret_cast<std::uintptr_t>(&hookedAdvanceMovie));
         vrlockpick::runtime::logNote("Hooked LockpickingMenu::AdvanceMovie");
 
-        // The menu's input handler (BSInputEventUser part): logged, used to
-        // learn the turn input, and called to send it. Patched only if RTTI
-        // confirms both vtables belong to LockpickingMenu.
-        auto* user = static_cast<RE::BSInputEventUser*>(menu);
-        const auto offset = static_cast<std::uint32_t>(reinterpret_cast<std::uintptr_t>(user) - reinterpret_cast<std::uintptr_t>(menu));
-        if (!vtableIs(menu, 0, "LockpickingMenu") || !vtableIs(user, offset, "LockpickingMenu")) {
-            vrlockpick::runtime::logWarning("LockpickingMenu input vtable not confirmed by RTTI; turn input not hooked");
-            return;
+        auto* inputVtable = *reinterpret_cast<std::uintptr_t**>(reinterpret_cast<std::uint8_t*>(menu) + 0x10);
+        if (inputVtable[7] == REL::Module::get().base() + kOnThumbstickOffset) {
+            g_originalOnThumbstick = reinterpret_cast<OnThumbstick_t>(inputVtable[7]);
+            REL::safe_write(reinterpret_cast<std::uintptr_t>(&inputVtable[7]), reinterpret_cast<std::uintptr_t>(&hookedOnThumbstick));
+            vrlockpick::runtime::logNote("Hooked LockpickingMenu thumbstick handler");
+        } else {
+            vrlockpick::runtime::logWarning("LockpickingMenu thumbstick handler not where expected; the stick may interrupt the hand's turn");
         }
-        auto* inputVtable = *reinterpret_cast<std::uintptr_t**>(user);
-        g_originalShouldHandle = reinterpret_cast<ShouldHandle_t>(inputVtable[1]);
-        REL::safe_write(reinterpret_cast<std::uintptr_t>(&inputVtable[1]), reinterpret_cast<std::uintptr_t>(&hookedShouldHandle));
-        g_originalOnThumbstick = reinterpret_cast<OnThumbstick_t>(inputVtable[4]);
-        g_originalOnButton = reinterpret_cast<OnButton_t>(inputVtable[8]);
-        REL::safe_write(reinterpret_cast<std::uintptr_t>(&inputVtable[4]), reinterpret_cast<std::uintptr_t>(&hookedOnThumbstick));
-        REL::safe_write(reinterpret_cast<std::uintptr_t>(&inputVtable[8]), reinterpret_cast<std::uintptr_t>(&hookedOnButton));
-        vrlockpick::runtime::logNote("Hooked LockpickingMenu input (thumbstick, button)");
 
     }
 
@@ -942,9 +618,6 @@ namespace
                                 vrlockpick::runtime::logWarning("LockpickingMenu not found in the menu map yet");
                             }
                             hookMenu(menu.get());
-                            if (menu) {
-                                g_inputUser = static_cast<RE::BSInputEventUser*>(menu.get());
-                            }
                         }
                     } else {
                         char message[160]{};
@@ -977,10 +650,7 @@ namespace
         static bool ready = false;
         if (!ready) {
             readSettings();
-            loadTurnInput();
-            if (g_settings.dumpGameCode) {
-                dumpGameCode();
-            }
+            findTurnLock();
             if (auto* ui = RE::UI::GetSingleton()) {
                 ui->RegisterSink<RE::MenuOpenCloseEvent>(&g_menuWatcher);
                 vrlockpick::runtime::logNote("Watching for the lockpicking menu (build " VRLOCKPICK_BUILD ")");
