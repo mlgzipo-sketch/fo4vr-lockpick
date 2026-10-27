@@ -665,7 +665,7 @@ namespace
         char message[256]{};
         std::snprintf(message, sizeof(message), "  %s: tip (%.1f, %.1f, %.1f) hold (%.1f, %.1f, %.1f) length %.1f, bound radius %.1f, scale %.2f",
             name, tool.tip.x, tool.tip.y, tool.tip.z, tool.hold.x, tool.hold.y, tool.hold.z, std::sqrt(dot(length, length)),
-            node->worldBound.radius, sc);
+            node->worldBound.fRadius, sc);
         vrlockpick::runtime::logNote(message);
         return std::sqrt(dot(length, length)) > 0.5f;
     }
