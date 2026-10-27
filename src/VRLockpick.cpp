@@ -246,17 +246,21 @@ namespace
 
         // The other hand turns the lock like a screwdriver: roll it past
         // fTurnStartDegrees to start, back under fTurnStopDegrees to let go.
-        // Only the crossings are written, so the game's turn button still works.
+        // The game clears turningLock every frame the button is up, so it is
+        // set every frame while the hand is turned; when the hand is not
+        // turned it is left alone and the game's turn button still works.
         if (g_settings.turnWithHand && s.haveWrench) {
             const float roll = std::fabs(s.wrenchRoll);
             if (!s.handTurning && roll > g_settings.turnStartDegrees) {
                 s.handTurning = true;
-                menu.turningLock = true;
                 vrlockpick::runtime::logInfo(s.wrenchRoll > 0.0f ? "Wrench hand turned (+): lock turn on" : "Wrench hand turned (-): lock turn on");
             } else if (s.handTurning && roll < g_settings.turnStopDegrees) {
                 s.handTurning = false;
                 menu.turningLock = false;
                 vrlockpick::runtime::logInfo("Wrench hand back: lock turn off");
+            }
+            if (s.handTurning) {
+                menu.turningLock = true;
             }
         }
 
