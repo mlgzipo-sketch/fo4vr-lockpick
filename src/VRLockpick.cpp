@@ -54,6 +54,10 @@ namespace
         // in the fingers); the screwdriver turns like a bolt, the lock
         // following the twist (a quarter turn opens it).
         bool pinNeedsTrigger{ false };
+        // Arm control: the docked pin points at the pinching fingers, like a
+        // clock hand whose tip stays in the keyhole (0 = it moves by as much
+        // as the hand moves around the keyhole, from where it was).
+        bool pinPointsAtHand{ true };
         // The tools start in the hands; bringing a tool's tip this close to
         // the keyhole puts it in place.
         bool toolsInHands{ true };
@@ -156,6 +160,8 @@ namespace
                     g_settings.dockDistance = value;
                 } else if (key == "bScrewTwist") {
                     g_settings.screwTwist = value != 0.0f;
+                } else if (key == "bPinPointsAtHand") {
+                    g_settings.pinPointsAtHand = value != 0.0f;
                 } else if (key == "bPinNeedsTrigger") {
                     g_settings.pinNeedsTrigger = value != 0.0f;
                 } else if (key == "fScrewLockDegreesPerTwist") {
@@ -219,6 +225,7 @@ namespace
         float grabOrbit{ 0.0f };
         float grabPickAngle{ 0.0f };
         float armPickAngle{ 0.0f };
+        float pinchDistance{ 0.0f };
         // Screwdriver twist around the keyhole axis.
         bool haveTwistReference{ false };
         bool twistUsesFingers{ false };
@@ -791,6 +798,37 @@ namespace
         }
     }
 
+    // The pick angle at which the docked pin points at the pinching fingers.
+    // The pin model is turned by rotY(pickAngle * pinModelSign) in its
+    // parent's space, which takes its direction (x, z) to
+    // (x cos - z sin, x sin + z cos): the angle is measured that way in the
+    // parent's x-z plane, from the pin's direction at angle 0.
+    bool pinAngleTowardHand(float& angle) noexcept
+    {
+        auto& s = g_session;
+        HandPose hand;
+        Vec3 center, axis;
+        if (!g_pin.node || !g_pin.node->parent || !readHand(g_settings.leftHandPick, hand) || !keyhole(center, axis)) {
+            return false;
+        }
+        const Vec3 hx = normalized(hand.alongFingers);
+        const Vec3 hy = normalized(hand.side);
+        const Vec3 hz = cross(hx, hy);
+        const Vec3& g = kPinHold.grip;
+        const Vec3 fingers{ hand.position.x + hx.x * g.x + hy.x * g.y + hz.x * g.z, hand.position.y + hx.y * g.x + hy.y * g.y + hz.y * g.z,
+            hand.position.z + hx.z * g.x + hy.z * g.y + hz.z * g.z };
+        Vec3 across;
+        s.pinchDistance = acrossAxis(fingers, center, axis, across);
+        if (s.pinchDistance < 3.0f) {
+            return false;  // too close to the keyhole for a direction
+        }
+        const Vec3 h = worldToLocalDir(g_pin.node->parent->world.rotate, across);
+        const Vec3 d = sub(g_pin.hold, g_pin.tip);
+        const float degrees = std::atan2(d.x * h.z - d.z * h.x, d.x * h.x + d.z * h.z) * 180.0f / kPi;
+        angle = clampPick(degrees * g_settings.pinModelSign);
+        return true;
+    }
+
     // Arm control (bArmControl): pin and screwdriver.
     void armControl(RE::LockpickingMenu& menu) noexcept
     {
@@ -829,7 +867,12 @@ namespace
                 s.pinGrabbed = false;
                 vrlockpick::runtime::logInfo("Pin let go");
             }
-            if (s.pinGrabbed) {
+            float aimed = 0.0f;
+            if (s.pinGrabbed && g_settings.pinPointsAtHand && g_settings.toolsInHands) {
+                if (pinAngleTowardHand(aimed)) {
+                    s.armPickAngle = aimed;
+                }
+            } else if (s.pinGrabbed) {
                 const float moved = wrapDegrees(s.handOrbit - s.grabOrbit) * g_settings.armPickSign * g_settings.pickDegreesPerHandDegree;
                 s.armPickAngle = clampPick(s.grabPickAngle + moved);
             }
@@ -936,7 +979,7 @@ namespace
             auto& t = g_pinNode->local.translate;
             const bool gameMoved = !s.pinWritten || std::fabs(s.gamePinAngle - s.writtenPinAngle) > 0.2f ||
                                    std::fabs(t.x - s.writtenPinPos.x) + std::fabs(t.z - s.writtenPinPos.z) > 0.01f;
-            if (gameMoved && s.pinWritten && s.pinDocked) {
+            if (gameMoved && s.pinWritten && s.pinDocked && std::fabs(s.gamePinAngle - s.writtenPinAngle) > 0.2f) {
                 char message[160]{};
                 std::snprintf(message, sizeof(message), "    game moved pin: angle %.2f pos (%.3f, %.3f, %.3f)", s.gamePinAngle, t.x, t.y, t.z);
                 vrlockpick::runtime::logInfo(message);
