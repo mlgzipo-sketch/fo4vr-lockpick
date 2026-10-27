@@ -31,7 +31,6 @@ namespace
         float pickDegreesPerHandDegree{ 1.0f };
         float maxPickAngle{ 90.0f };
         bool turnWithHand{ true };
-        bool blockStick{ true };
         float turnStartDegrees{ 25.0f };
         float turnStopDegrees{ 15.0f };
     };
@@ -40,7 +39,6 @@ namespace
     const hands::ApiV1* g_hands{};
     std::uint64_t g_ownerToken{ 0 };
     std::uint64_t g_rockFrames{ 0 };
-    std::uint64_t g_stickEvents{ 0 };
 
     struct Vec3
     {
@@ -114,8 +112,6 @@ namespace
                     g_settings.pickDegreesPerHandDegree = value;
                 } else if (key == "fMaxPickAngle") {
                     g_settings.maxPickAngle = value;
-                } else if (key == "bBlockStick") {
-                    g_settings.blockStick = value != 0.0f;
                 } else if (key == "bTurnWithHand") {
                     g_settings.turnWithHand = value != 0.0f;
                 } else if (key == "fTurnStartDegrees") {
@@ -127,8 +123,8 @@ namespace
         } catch (...) {
         }
         char message[256]{};
-        std::snprintf(message, sizeof(message), "Settings: bBlockStick=%d bDrivePick=%d bLeftHandPick=%d fPickDegreesPerHandDegree=%.2f fMaxPickAngle=%.1f bTurnWithHand=%d fTurnStartDegrees=%.1f fTurnStopDegrees=%.1f",
-            g_settings.blockStick ? 1 : 0, g_settings.drivePick ? 1 : 0, g_settings.leftHandPick ? 1 : 0, g_settings.pickDegreesPerHandDegree, g_settings.maxPickAngle,
+        std::snprintf(message, sizeof(message), "Settings: bDrivePick=%d bLeftHandPick=%d fPickDegreesPerHandDegree=%.2f fMaxPickAngle=%.1f bTurnWithHand=%d fTurnStartDegrees=%.1f fTurnStopDegrees=%.1f",
+            g_settings.drivePick ? 1 : 0, g_settings.leftHandPick ? 1 : 0, g_settings.pickDegreesPerHandDegree, g_settings.maxPickAngle,
             g_settings.turnWithHand ? 1 : 0, g_settings.turnStartDegrees, g_settings.turnStopDegrees);
         vrlockpick::runtime::logNote(message);
     }
@@ -257,7 +253,6 @@ namespace
         s = Session{};
         s.active = true;
         s.rockFramesAtOpen = g_rockFrames;
-        g_stickEvents = 0;
         s.lastLog = Clock::now();
         logMenuState("Lockpicking opened", menu);
         logPoint("lockRoot", menu.lockRoot.get());
@@ -397,21 +392,6 @@ namespace
         }
     }
 
-    // LockpickingMenu's BSInputEventUser part (at +0x10) gets the thumbstick
-    // (vtable slot 4). With bBlockStick the stick no longer reaches the menu.
-    using OnThumbstick_t = void (*)(RE::BSInputEventUser*, const RE::ThumbstickEvent*);
-    OnThumbstick_t g_originalOnThumbstick{ nullptr };
-
-    void hookedOnThumbstick(RE::BSInputEventUser* user, const RE::ThumbstickEvent* event)
-    {
-        if (g_stickEvents++ == 0) {
-            vrlockpick::runtime::logNote(g_settings.blockStick ? "First thumbstick event in the menu: blocked" : "First thumbstick event in the menu: passed on");
-        }
-        if (!g_settings.blockStick) {
-            g_originalOnThumbstick(user, event);
-        }
-    }
-
     // The vtable is taken from the live menu, so no address library entry is needed.
     void hookMenu(RE::IMenu* menu) noexcept
     {
@@ -423,10 +403,6 @@ namespace
         REL::safe_write(reinterpret_cast<std::uintptr_t>(&vtable[4]), reinterpret_cast<std::uintptr_t>(&hookedAdvanceMovie));
         vrlockpick::runtime::logNote("Hooked LockpickingMenu::AdvanceMovie");
 
-        auto* inputVtable = *reinterpret_cast<std::uintptr_t**>(reinterpret_cast<std::uintptr_t>(menu) + 0x10);
-        g_originalOnThumbstick = reinterpret_cast<OnThumbstick_t>(inputVtable[4]);
-        REL::safe_write(reinterpret_cast<std::uintptr_t>(&inputVtable[4]), reinterpret_cast<std::uintptr_t>(&hookedOnThumbstick));
-        vrlockpick::runtime::logNote("Hooked LockpickingMenu::OnThumbstickEvent");
     }
 
     class MenuWatcher final : public RE::BSTEventSink<RE::MenuOpenCloseEvent>
