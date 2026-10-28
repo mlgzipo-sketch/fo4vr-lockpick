@@ -980,56 +980,152 @@ namespace
 
     // ---- Tools held rigidly in the hands ----
     // A tool placed from the hand pose and the finger bones each frame mixed
-    // poses from different moments and wobbled in the hand on its own. Now
-    // its placement is measured once in the wrist's space (while the hand is
-    // still and the fingers have closed) and then carried by the wrist, as
-    // if fixed to it.
+    // poses from different moments and wobbled in the hand on its own. Its
+    // placement is measured once in the hand's own frame (ROCK's, the
+    // visible hand; FRIK's wrist bone drifted from it) while the hand is
+    // still and the fingers have closed, and then carried by that frame.
+
+    // Rigid frames: rows of rotate are the axes in world, unit scale.
+    Placement relativeTo(const Placement& parent, const Placement& child) noexcept
+    {
+        Placement r;
+        auto& P = const_cast<RE::NiMatrix3&>(parent.rotate);
+        auto& C = const_cast<RE::NiMatrix3&>(child.rotate);
+        for (int i = 0; i < 3; ++i) {
+            for (int j = 0; j < 3; ++j) {
+                cell(r.rotate, i, j) = cell(C, i, 0) * cell(P, j, 0) + cell(C, i, 1) * cell(P, j, 1) + cell(C, i, 2) * cell(P, j, 2);
+            }
+        }
+        r.origin = worldToLocalDir(P, sub(child.origin, parent.origin));
+        return r;
+    }
+
+    Placement carriedBy(const Placement& parent, const Placement& relative) noexcept
+    {
+        Placement w;
+        auto& P = const_cast<RE::NiMatrix3&>(parent.rotate);
+        auto& R = const_cast<RE::NiMatrix3&>(relative.rotate);
+        for (int i = 0; i < 3; ++i) {
+            for (int j = 0; j < 3; ++j) {
+                cell(w.rotate, i, j) = cell(R, i, 0) * cell(P, 0, j) + cell(R, i, 1) * cell(P, 1, j) + cell(R, i, 2) * cell(P, 2, j);
+            }
+        }
+        w.origin = add(parent.origin, localToWorldDir(P, relative.origin));
+        return w;
+    }
+
+    Placement handFrame(const HandPose& hand) noexcept
+    {
+        const Vec3 x = normalized(hand.alongFingers);
+        const Vec3 y = normalized(acrossOnly(hand.side, x));
+        const Vec3 z = cross(x, y);
+        Placement f;
+        const Vec3 rows[3]{ x, y, z };
+        for (int i = 0; i < 3; ++i) {
+            cell(f.rotate, i, 0) = rows[i].x;
+            cell(f.rotate, i, 1) = rows[i].y;
+            cell(f.rotate, i, 2) = rows[i].z;
+        }
+        f.origin = hand.position;
+        return f;
+    }
+
+    Placement fromTransform(const RE::NiTransform& t) noexcept
+    {
+        return { t.rotate, fromNi(t.translate) };
+    }
+
     struct HeldTool
     {
         bool have{ false };
         int frames{ 0 };
         Vec3 lastAlong;
         Vec3 lastSide;
-        RE::NiMatrix3 rotate;  // tool rows in the wrist's space
-        Vec3 translate;        // tool origin in the wrist's space
+        Placement inHand;  // the tool in the hand's frame
     };
     HeldTool g_heldPin;
     HeldTool g_heldScrew;
 
-    // Holds the visible hand with its fingers on the tool's hold point,
-    // turned as the controller is; lets go if the controller is too far,
-    // and takes the tool again once it is back within most of that.
+    // While a hand is free: its frame in the controller's (wand's) space and
+    // FRIK's wrist in its frame, to steer and to hold it when it is held.
+    struct HandRecord
+    {
+        bool have{ false };
+        Vec3 lastAlong;
+        Vec3 lastSide;
+        Placement inWand;
+        Placement wristInHand;
+    };
+    HandRecord g_handRecord[2];
+
+    void recordHand(const bool left, const HandPose& hand) noexcept
+    {
+        auto& record = g_handRecord[left ? 1 : 0];
+        const float moved = 2.0f - dot(record.lastAlong, hand.alongFingers) - dot(record.lastSide, hand.side);
+        record.lastAlong = hand.alongFingers;
+        record.lastSide = hand.side;
+        RE::NiTransform wand, wrist;
+        // Only a fairly still hand: the ROCK frame and FRIK's bones may be a
+        // frame apart.
+        if (vrlockpick::grip::glued(left) || moved > 4e-4f || !vrlockpick::grip::wand(left, wand) || !wristBone(left, wrist)) {
+            return;
+        }
+        const Placement frame = handFrame(hand);
+        record.inWand = relativeTo(fromTransform(wand), frame);
+        record.wristInHand = relativeTo(frame, fromTransform(wrist));
+        record.have = true;
+    }
+
+    // The smallest turn taking direction from onto to, applied to v.
+    Vec3 swing(const Vec3& v, const Vec3& from, const Vec3& to) noexcept
+    {
+        const Vec3 axis = cross(from, to);
+        const float c = dot(from, to);
+        if (c < -0.999f) {
+            return v;
+        }
+        const Vec3 once = cross(axis, v);
+        return add(v, add(once, scaled(cross(axis, once), 1.0f / (1.0f + c))));
+    }
+
+    // Holds the visible hand on a tool in the lock as it held it before:
+    // the hand as the controller turns it, swung just enough to line up with
+    // the tool (no extra twist of the wrist), moved so the tool sits in the
+    // fingers. Lets go if the controller is too far, and takes the tool
+    // again once it is back within most of that.
     Vec3 g_glueAt[2];
 
-    void glueHand(const bool left, const bool docked, const Tool& tool, const bool pinch, const HoldPose& pose) noexcept
+    void glueHand(const bool left, const bool docked, const Tool& tool, const HeldTool& held) noexcept
     {
         recordWrist(left);
-        RE::NiTransform controller, wrist;
         HandPose hand;
-        if (!g_settings.glueHands || !docked || !tool.node || !controllerWrist(left, controller) || !wristBone(left, wrist) || !readHand(left, hand)) {
+        if (readHand(left, hand)) {
+            recordHand(left, hand);
+        }
+        const auto& record = g_handRecord[left ? 1 : 0];
+        RE::NiTransform wand;
+        if (!g_settings.glueHands || !docked || !tool.node || !held.have || !record.have || !vrlockpick::grip::wand(left, wand)) {
             vrlockpick::grip::unglue(left);
             return;
         }
-        // The wrist where it held the tool before the lock (the tool's
-        // place in the wrist's space, turned around), so the hand holds it
-        // the same way; else the fingers moved onto the tool's hold point.
-        const HeldTool& held = pinch ? g_heldPin : g_heldScrew;
-        RE::NiMatrix3 turned = controller.rotate;
-        Vec3 at;
-        if (held.have) {
-            auto& T = tool.node->world.rotate;
-            auto& R = const_cast<RE::NiMatrix3&>(held.rotate);
-            for (int i = 0; i < 3; ++i) {
-                for (int j = 0; j < 3; ++j) {
-                    cell(turned, i, j) = cell(R, 0, i) * cell(T, 0, j) + cell(R, 1, i) * cell(T, 1, j) + cell(R, 2, i) * cell(T, 2, j);
-                }
-            }
-            at = sub(fromNi(tool.node->world.translate), localToWorldDir(turned, scaled(held.translate, wrist.scale)));
-        } else {
-            const Vec3 fingers = sub(holdPoint(left, pinch, hand, pose), fromNi(wrist.translate));
-            at = sub(nodePointWorld(*tool.node, tool.hold), fingers);
+        const Placement controlled = carriedBy(fromTransform(wand), record.inWand);
+        const Vec3 along = normalized(sub(tool.tip, tool.hold));
+        const Vec3 inHandDir = localToWorldDir(carriedBy(controlled, held.inHand).rotate, along);
+        const Vec3 lockDir = localToWorldDir(tool.node->world.rotate, along);
+        Placement frame = controlled;
+        for (int i = 0; i < 3; ++i) {
+            const Vec3 row = swing({ cell(frame.rotate, i, 0), cell(frame.rotate, i, 1), cell(frame.rotate, i, 2) }, inHandDir, lockDir);
+            cell(frame.rotate, i, 0) = row.x;
+            cell(frame.rotate, i, 1) = row.y;
+            cell(frame.rotate, i, 2) = row.z;
         }
-        const Vec3 pull = sub(at, fromNi(controller.translate));
+        // Place the frame so the tool's hold point is where it is in the lock.
+        frame.origin = {};
+        const Placement toolHere = carriedBy(frame, held.inHand);
+        const Vec3 holdHere = add(toolHere.origin, localToWorldDir(toolHere.rotate, scaled(tool.hold, tool.node->world.scale)));
+        frame.origin = sub(nodePointWorld(*tool.node, tool.hold), holdHere);
+
+        const Vec3 pull = sub(frame.origin, controlled.origin);
         const float reach = vrlockpick::grip::glued(left) ? g_settings.glueMaxDistance : g_settings.glueMaxDistance * 0.7f;
         if (std::sqrt(dot(pull, pull)) > reach) {
             if (vrlockpick::grip::glued(left)) {
@@ -1040,72 +1136,51 @@ namespace
             vrlockpick::grip::unglue(left);
             return;
         }
+        const Placement wrist = carriedBy(frame, record.wristInHand);
         // Smooth out what's left of the frame-to-frame noise.
+        Vec3 at = wrist.origin;
         auto& last = g_glueAt[left ? 1 : 0];
         if (vrlockpick::grip::glued(left)) {
             at = add(last, scaled(sub(at, last), 0.5f));
         }
         last = at;
-        RE::NiTransform target = controller;
-        target.rotate = turned;
+        RE::NiTransform target = wand;
+        target.rotate = wrist.rotate;
         target.translate = { at.x, at.y, at.z };
+        target.scale = 1.0f;
         vrlockpick::grip::glue(left, target);
     }
 
-    void measureHeld(HeldTool& held, const bool left, const HandPose& hand, const Placement& p, const char* name) noexcept
+    void measureHeld(HeldTool& held, const HandPose& hand, const Placement& p, const char* name) noexcept
     {
         ++held.frames;
         const float moved = 2.0f - dot(held.lastAlong, hand.alongFingers) - dot(held.lastSide, hand.side);
         held.lastAlong = hand.alongFingers;
         held.lastSide = hand.side;
-        RE::NiTransform wrist;
         // Fingers need a moment to close; then wait for a still hand (under
         // about half a degree a frame), or take it anyway after 1.5 s.
-        if (held.frames < 30 || (moved > 4e-5f && held.frames < 135) || !wristBone(left, wrist)) {
+        if (held.frames < 30 || (moved > 4e-5f && held.frames < 135)) {
             return;
         }
-        auto& Wr = wrist.rotate;
-        auto& W = const_cast<RE::NiMatrix3&>(p.rotate);
-        for (int i = 0; i < 3; ++i) {
-            for (int j = 0; j < 3; ++j) {
-                cell(held.rotate, i, j) = cell(W, i, 0) * cell(Wr, j, 0) + cell(W, i, 1) * cell(Wr, j, 1) + cell(W, i, 2) * cell(Wr, j, 2);
-            }
-        }
-        const float sc = wrist.scale > 1e-4f ? wrist.scale : 1.0f;
-        held.translate = scaled(worldToLocalDir(Wr, sub(p.origin, fromNi(wrist.translate))), 1.0f / sc);
+        held.inHand = relativeTo(handFrame(hand), p);
         held.have = true;
         char message[200]{};
-        std::snprintf(message, sizeof(message), "  %s fixed in the hand after %d frames: at (%.1f, %.1f, %.1f) from the wrist", name, held.frames,
-            held.translate.x, held.translate.y, held.translate.z);
+        std::snprintf(message, sizeof(message), "  %s fixed in the hand after %d frames: at (%.1f, %.1f, %.1f) in the hand frame", name, held.frames,
+            held.inHand.origin.x, held.inHand.origin.y, held.inHand.origin.z);
         vrlockpick::runtime::logNote(message);
-    }
-
-    bool heldPlacement(const HeldTool& held, const bool left, Placement& p) noexcept
-    {
-        RE::NiTransform wrist;
-        if (!held.have || !wristBone(left, wrist)) {
-            return false;
-        }
-        auto& Wr = wrist.rotate;
-        auto& R = const_cast<RE::NiMatrix3&>(held.rotate);
-        for (int i = 0; i < 3; ++i) {
-            for (int j = 0; j < 3; ++j) {
-                cell(p.rotate, i, j) = cell(R, i, 0) * cell(Wr, 0, j) + cell(R, i, 1) * cell(Wr, 1, j) + cell(R, i, 2) * cell(Wr, 2, j);
-            }
-        }
-        p.origin = add(fromNi(wrist.translate), localToWorldDir(Wr, scaled(held.translate, wrist.scale)));
-        return true;
     }
 
     // Places a tool still in the hand; returns its tip in world space.
     Vec3 holdTool(const Tool& tool, HeldTool& held, const bool left, const bool pinch, const HandPose& hand, const HoldPose& pose, const char* name) noexcept
     {
         Placement p;
-        if (!heldPlacement(held, left, p)) {
+        if (held.have) {
+            p = carriedBy(handFrame(hand), held.inHand);
+        } else {
             Vec3 fingers;
             const bool haveFingers = fingerHold(left, pinch, fingers);
             p = toolInHand(tool, hand, pose, haveFingers ? &fingers : nullptr, nullptr);
-            measureHeld(held, left, hand, p, name);
+            measureHeld(held, hand, p, name);
         }
         return putTool(tool, p, false);
     }
@@ -1134,19 +1209,19 @@ namespace
     }
 
     // FRIK's frame end (every bone final): the held tools again, on this
-    // frame's wrists, world transforms included.
+    // frame's hands, world transforms included.
     void onHandsFinal() noexcept
     {
         const auto& s = g_session;
         if (!s.active || !g_settings.toolsInHands || !s.toolsPrepared) {
             return;
         }
-        Placement p;
-        if (!s.pinDocked && g_pin.node && heldPlacement(g_heldPin, g_settings.leftHandPick, p)) {
-            (void)putTool(g_pin, p, true);
+        HandPose hand;
+        if (!s.pinDocked && g_pin.node && g_heldPin.have && readHand(g_settings.leftHandPick, hand)) {
+            (void)putTool(g_pin, carriedBy(handFrame(hand), g_heldPin.inHand), true);
         }
-        if (!s.screwDocked && g_screw.node && heldPlacement(g_heldScrew, !g_settings.leftHandPick, p)) {
-            (void)putTool(g_screw, p, true);
+        if (!s.screwDocked && g_screw.node && g_heldScrew.have && readHand(!g_settings.leftHandPick, hand)) {
+            (void)putTool(g_screw, carriedBy(handFrame(hand), g_heldScrew.inHand), true);
         }
     }
 
@@ -1453,8 +1528,8 @@ namespace
         }
         updateToolsInHands(menu);
         if (g_settings.armControl && g_settings.toolsInHands && s.toolsPrepared && !menu.animating) {
-            glueHand(g_settings.leftHandPick, s.pinDocked, g_pin, true, kPinHold);
-            glueHand(!g_settings.leftHandPick, s.screwDocked, g_screw, false, kScrewHold);
+            glueHand(g_settings.leftHandPick, s.pinDocked, g_pin, g_heldPin);
+            glueHand(!g_settings.leftHandPick, s.screwDocked, g_screw, g_heldScrew);
         }
         sweetSpotBuzz(menu);
         const bool changed = menu.turningLock != s.lastTurning || menu.picksBroken != s.lastPicksBroken;
