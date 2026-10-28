@@ -63,13 +63,13 @@ namespace vrlockpick::grip
                 pose.ring = { 0.45f, 0.35f, 0.35f, 0.0f };
                 pose.pinky = { 0.45f, 0.35f, 0.35f, 0.0f };
             } else {
-                // Screwdriver handle across the fist, the fingers wrapped
-                // around it and the thumb over them.
-                pose.thumb = { 0.85f, 0.6f, 0.6f, 0.0f };
-                pose.index = { 0.55f, 0.35f, 0.45f, 0.0f };
-                pose.middle = { 0.45f, 0.3f, 0.4f, 0.0f };
-                pose.ring = { 0.45f, 0.3f, 0.4f, 0.0f };
-                pose.pinky = { 0.5f, 0.3f, 0.4f, 0.0f };
+                // Screwdriver handle in the palm, thumb along it (the user's
+                // reference pose).
+                pose.thumb = { 1.0f, 1.0f, 1.0f, 0.0f };
+                pose.index = { 1.0f, 0.59f, 0.86f, 0.0f };
+                pose.middle = { 0.63f, 0.3f, 0.3f, 0.0f };
+                pose.ring = { 0.65f, 0.31f, 0.54f, 0.0f };
+                pose.pinky = { 0.86f, 0.45f, 0.45f, 0.0f };
             }
             return pose;
         }

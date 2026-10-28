@@ -868,7 +868,7 @@ namespace
     }
 
     // Where the visible fingers hold a tool: between the thumb and index
-    // tips for the pin, the middle of the curled fingers for the screwdriver.
+    // tips for the pin, the middle of the lower three fingers for the screwdriver.
     bool fingerHold(const bool left, const bool pinch, Vec3& out) noexcept
     {
         if (pinch) {
@@ -882,7 +882,8 @@ namespace
             out = scaled(add(thumb, fromNi(index)), 0.5f);
             return true;
         }
-        constexpr const char* kCurled[]{ "Finger21", "Finger22", "Finger23", "Finger31", "Finger32", "Finger33", "Finger41", "Finger42", "Finger43" };
+        // Middle, ring and little fingers: the handle sits low in the hand.
+        constexpr const char* kCurled[]{ "Finger31", "Finger32", "Finger33", "Finger41", "Finger42", "Finger43", "Finger51", "Finger52", "Finger53" };
         Vec3 sum{};
         for (const auto* bone : kCurled) {
             Vec3 p;
@@ -1103,14 +1104,7 @@ namespace
         if (!heldPlacement(held, left, p)) {
             Vec3 fingers;
             const bool haveFingers = fingerHold(left, pinch, fingers);
-            // A screwdriver lies across the fist, its shaft out past the index.
-            Vec3 index, pinky, across;
-            const bool haveAcross = !pinch && fingerBone(left, "Finger21", index) &&
-                                    (fingerBone(left, "Finger51", pinky) || fingerBone(left, "Finger41", pinky));
-            if (haveAcross) {
-                across = normalized(sub(index, pinky));
-            }
-            p = toolInHand(tool, hand, pose, haveFingers ? &fingers : nullptr, haveAcross ? &across : nullptr);
+            p = toolInHand(tool, hand, pose, haveFingers ? &fingers : nullptr, nullptr);
             measureHeld(held, left, hand, p, name);
         }
         return putTool(tool, p, false);
