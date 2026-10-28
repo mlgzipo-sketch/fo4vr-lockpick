@@ -14,6 +14,7 @@ namespace vrlockpick::grip
     bool bone(const char* name, RE::NiTransform& out) noexcept;
     bool indexTip(bool left, RE::NiPoint3& out) noexcept;
     bool trackedHand(bool left, RE::NiTransform& out) noexcept;
+    bool wand(bool left, RE::NiTransform& out) noexcept;
 
     // Holds the visible hand at this wrist transform (like a weapon grip)
     // until unglued; the controller keeps moving freely.

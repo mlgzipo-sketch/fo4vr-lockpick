@@ -131,6 +131,12 @@ namespace vrlockpick::grip
         return frik && frik->getTrackedHandTransform(frikHand(left), FRIKApiV2::TrackedHandKind::FirstPersonHand, &out);
     }
 
+    bool wand(const bool left, RE::NiTransform& out) noexcept
+    {
+        auto* frik = body();
+        return frik && frik->getTrackedHandTransform(frikHand(left), FRIKApiV2::TrackedHandKind::Wand, &out);
+    }
+
     bool glue(const bool left, const RE::NiTransform& wrist) noexcept
     {
         auto* frik = body();

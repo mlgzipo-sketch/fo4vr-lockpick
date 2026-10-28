@@ -852,37 +852,104 @@ namespace
         return add(hand.position, add(scaled(hx, pose.grip.x), add(scaled(hy, pose.grip.y), scaled(hz, pose.grip.z))));
     }
 
+    // Where the controller alone would put each wrist. The hand FRIK
+    // reports as tracked follows a held hand, so it can't be used (the hand
+    // chased itself and shook); the controller (wand) never does. While a
+    // hand is free its wrist is recorded in the wand's space, and a held
+    // hand's wrist is that record carried by the wand.
+    struct WristInWand
+    {
+        bool have{ false };
+        RE::NiMatrix3 rotate;
+        Vec3 translate;
+    };
+    WristInWand g_wristInWand[2];
+
+    bool wristBone(const bool left, RE::NiTransform& out) noexcept
+    {
+        return vrlockpick::grip::bone(left ? "LArm_Hand" : "RArm_Hand", out);
+    }
+
+    // Rows are axes in world (world = R^T v): child R = local R * parent R.
+    void recordWrist(const bool left) noexcept
+    {
+        RE::NiTransform wand, wrist;
+        if (vrlockpick::grip::glued(left) || !vrlockpick::grip::wand(left, wand) || !wristBone(left, wrist)) {
+            return;
+        }
+        auto& record = g_wristInWand[left ? 1 : 0];
+        for (int i = 0; i < 3; ++i) {
+            for (int j = 0; j < 3; ++j) {
+                cell(record.rotate, i, j) = cell(wrist.rotate, i, 0) * cell(wand.rotate, j, 0) + cell(wrist.rotate, i, 1) * cell(wand.rotate, j, 1) +
+                                            cell(wrist.rotate, i, 2) * cell(wand.rotate, j, 2);
+            }
+        }
+        const float sc = wand.scale > 1e-4f ? wand.scale : 1.0f;
+        record.translate = scaled(worldToLocalDir(wand.rotate, sub(fromNi(wrist.translate), fromNi(wand.translate))), 1.0f / sc);
+        record.have = true;
+    }
+
+    bool controllerWrist(const bool left, RE::NiTransform& out) noexcept
+    {
+        const auto& record = g_wristInWand[left ? 1 : 0];
+        RE::NiTransform wand;
+        if (!record.have || !vrlockpick::grip::wand(left, wand)) {
+            return false;
+        }
+        out = wand;
+        auto& recorded = const_cast<RE::NiMatrix3&>(record.rotate);
+        for (int i = 0; i < 3; ++i) {
+            for (int j = 0; j < 3; ++j) {
+                cell(out.rotate, i, j) = cell(recorded, i, 0) * cell(wand.rotate, 0, j) + cell(recorded, i, 1) * cell(wand.rotate, 1, j) +
+                                         cell(recorded, i, 2) * cell(wand.rotate, 2, j);
+            }
+        }
+        const Vec3 t = add(fromNi(wand.translate), localToWorldDir(wand.rotate, scaled(record.translate, wand.scale)));
+        out.translate = { t.x, t.y, t.z };
+        out.scale = 1.0f;
+        return true;
+    }
+
     // How far the controller is from the visible hand: zero unless the hand
     // is held on a tool. Hand input adds it, so a held hand still steers.
     Vec3 handShift(const bool left) noexcept
     {
-        RE::NiTransform tracked, wrist;
-        if (!vrlockpick::grip::glued(left) || !vrlockpick::grip::trackedHand(left, tracked) ||
-            !vrlockpick::grip::bone(left ? "LArm_Hand" : "RArm_Hand", wrist)) {
+        RE::NiTransform controller, wrist;
+        if (!vrlockpick::grip::glued(left) || !controllerWrist(left, controller) || !wristBone(left, wrist)) {
             return {};
         }
-        return sub(fromNi(tracked.translate), fromNi(wrist.translate));
+        return sub(fromNi(controller.translate), fromNi(wrist.translate));
     }
 
     // Holds the visible hand with its fingers on the tool's hold point,
-    // turned as the controller is; lets go if the controller is too far.
+    // turned as the controller is; lets go if the controller is too far,
+    // and takes the tool again once it is back within most of that.
+    Vec3 g_glueAt[2];
+
     void glueHand(const bool left, const bool docked, const Tool& tool, const bool pinch, const HoldPose& pose) noexcept
     {
-        RE::NiTransform tracked, wrist;
+        recordWrist(left);
+        RE::NiTransform controller, wrist;
         HandPose hand;
-        if (!g_settings.glueHands || !docked || !tool.node || !vrlockpick::grip::trackedHand(left, tracked) ||
-            !vrlockpick::grip::bone(left ? "LArm_Hand" : "RArm_Hand", wrist) || !readHand(left, hand)) {
+        if (!g_settings.glueHands || !docked || !tool.node || !controllerWrist(left, controller) || !wristBone(left, wrist) || !readHand(left, hand)) {
             vrlockpick::grip::unglue(left);
             return;
         }
         const Vec3 fingers = sub(holdPoint(left, pinch, hand, pose), fromNi(wrist.translate));
-        const Vec3 at = sub(nodePointWorld(*tool.node, tool.hold), fingers);
-        const Vec3 pull = sub(at, fromNi(tracked.translate));
-        if (std::sqrt(dot(pull, pull)) > g_settings.glueMaxDistance) {
+        Vec3 at = sub(nodePointWorld(*tool.node, tool.hold), fingers);
+        const Vec3 pull = sub(at, fromNi(controller.translate));
+        const float reach = vrlockpick::grip::glued(left) ? g_settings.glueMaxDistance : g_settings.glueMaxDistance * 0.7f;
+        if (std::sqrt(dot(pull, pull)) > reach) {
             vrlockpick::grip::unglue(left);
             return;
         }
-        RE::NiTransform target = tracked;
+        // Smooth out what's left of the frame-to-frame noise.
+        auto& last = g_glueAt[left ? 1 : 0];
+        if (vrlockpick::grip::glued(left)) {
+            at = add(last, scaled(sub(at, last), 0.5f));
+        }
+        last = at;
+        RE::NiTransform target = controller;
         target.translate = { at.x, at.y, at.z };
         vrlockpick::grip::glue(left, target);
     }
