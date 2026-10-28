@@ -21,4 +21,7 @@ namespace vrlockpick::grip
     bool glue(bool left, const RE::NiTransform& wrist) noexcept;
     void unglue(bool left) noexcept;
     bool glued(bool left) noexcept;
+
+    // Called at the end of FRIK's frame, once every bone is final.
+    void onHandsFinal(void (*callback)() noexcept) noexcept;
 }

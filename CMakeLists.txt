@@ -36,6 +36,8 @@ endif()
 add_library(VRLockpick SHARED
   src/Grip.cpp
   src/Grip.h
+  src/Haptics.cpp
+  src/Haptics.h
   src/Runtime.cpp
   src/Runtime.h
   src/VRLockpick.cpp

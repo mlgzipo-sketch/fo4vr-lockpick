@@ -20,6 +20,14 @@ namespace vrlockpick::grip
 
         bool g_tried{ false };
         bool g_holding[2]{};
+        void (*g_handsFinal)() noexcept { nullptr };
+
+        void FRIK_CALL handsFinal(std::uint32_t, void*) noexcept
+        {
+            if (g_handsFinal) {
+                g_handsFinal();
+            }
+        }
 
         const FRIKApiV2* api() noexcept
         {
@@ -28,8 +36,10 @@ namespace vrlockpick::grip
                 const int error = FRIKApiV2::initialize(1);
                 char message[160]{};
                 if (error == 0) {
-                    std::snprintf(message, sizeof(message), "Grip: FRIK %s, API v2.%u; fingers hold the tools",
-                        FRIKApiV2::inst->getModVersion(), FRIKApiV2::inst->getVersion());
+                    const bool callback = FRIKApiV2::inst->getVersion() >= 3 &&
+                                          FRIKApiV2::inst->registerFrameCallback(kTag, static_cast<std::uint32_t>(FRIKApiV2::FramePhase::AfterWorldFinal), handsFinal, nullptr, 0);
+                    std::snprintf(message, sizeof(message), "Grip: FRIK %s, API v2.%u; fingers hold the tools%s",
+                        FRIKApiV2::inst->getModVersion(), FRIKApiV2::inst->getVersion(), callback ? ", tools follow the final hands" : "");
                 } else {
                     std::snprintf(message, sizeof(message), "Grip: FRIK API v2 unavailable (error %d); fingers stay as they are", error);
                 }
@@ -167,5 +177,10 @@ namespace vrlockpick::grip
     bool glued(const bool left) noexcept
     {
         return g_glued[left ? 1 : 0];
+    }
+
+    void onHandsFinal(void (*callback)() noexcept) noexcept
+    {
+        g_handsFinal = callback;
     }
 }

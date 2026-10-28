@@ -4,6 +4,7 @@
 #include <ROCK/Hands.h>
 #include <ROCK/Input.h>
 #include "Grip.h"
+#include "Haptics.h"
 #include "Runtime.h"
 
 #include <RE/Fallout.h>
@@ -64,6 +65,10 @@ namespace
         float screwSign{ 1.0f };
         // The visible hands stay on the docked tools, like on a weapon,
         // until the controller is this far (game units) from them.
+        // The pin hand's controller buzzes when the pin reaches the spot that
+        // opens the lock, and softly while it stays there (0 = off).
+        bool sweetSpotBuzz{ true };
+        float sweetSpotHoldBuzz{ 0.3f };
         bool glueHands{ true };
         float glueMaxDistance{ 20.0f };
         // The tools start in the hands; bringing a tool's tip this close to
@@ -172,6 +177,10 @@ namespace
                     g_settings.screwPointsAtHand = value != 0.0f;
                 } else if (key == "fScrewSign") {
                     g_settings.screwSign = value;
+                } else if (key == "bSweetSpotBuzz") {
+                    g_settings.sweetSpotBuzz = value != 0.0f;
+                } else if (key == "fSweetSpotHoldBuzz") {
+                    g_settings.sweetSpotHoldBuzz = value;
                 } else if (key == "bGlueHands") {
                     g_settings.glueHands = value != 0.0f;
                 } else if (key == "fGlueMaxDistance") {
@@ -248,6 +257,8 @@ namespace
         bool haveScrewZero{ false };
         float screwZero{ 0.0f };
         bool loggedFingers{ false };
+        bool inSweetSpot{ false };
+        int buzzFrames{ 0 };
         // Screwdriver twist around the keyhole axis.
         bool haveTwistReference{ false };
         bool twistUsesFingers{ false };
@@ -738,10 +749,17 @@ namespace
     // Screwdriver handle in the palm, the shaft along the fingers.
     constexpr HoldPose kScrewHold{ { 3.9f, -3.2f, 1.3f }, { 0.921f, -0.174f, -0.348f }, { -0.915f, -0.014f, -0.403f } };
 
-    // Puts a tool in the hand as in the reference: its hold point at the
-    // grip, pointing to its tip and turned so its keyhole axis matches.
-    // Returns where its tip is now, in world space.
-    Vec3 placeInHand(const Tool& tool, const HandPose& hand, const HoldPose& pose, const Vec3* fingers) noexcept
+    // Where a tool goes: rows of rotate are its axes in world, origin its
+    // node's position.
+    struct Placement
+    {
+        RE::NiMatrix3 rotate;
+        Vec3 origin;
+    };
+
+    // A tool in the hand as in the reference: its hold point at the grip,
+    // pointing to its tip and turned so its keyhole axis matches.
+    Placement toolInHand(const Tool& tool, const HandPose& hand, const HoldPose& pose, const Vec3* fingers) noexcept
     {
         auto* node = tool.node;
         auto& parent = *node->parent;
@@ -766,40 +784,74 @@ namespace
         // World rotation, rows = tool axes in world: W[i][j] = u_i u2_j + v_i v2_j + w_i w2_j.
         const float uu[3]{ u.x, u.y, u.z }, vv[3]{ v.x, v.y, v.z }, ww[3]{ w.x, w.y, w.z };
         const float u2a[3]{ u2.x, u2.y, u2.z }, v2a[3]{ v2.x, v2.y, v2.z }, w2a[3]{ w2.x, w2.y, w2.z };
-        float W[3][3]{};
+        Placement p;
         for (int i = 0; i < 3; ++i) {
             for (int j = 0; j < 3; ++j) {
-                W[i][j] = uu[i] * u2a[j] + vv[i] * v2a[j] + ww[i] * w2a[j];
-            }
-        }
-        // Local rotation = W * P^T.
-        auto& P = parent.world.rotate;
-        auto& L = node->local.rotate;
-        for (int i = 0; i < 3; ++i) {
-            for (int j = 0; j < 3; ++j) {
-                cell(L, i, j) = W[i][0] * cell(P, j, 0) + W[i][1] * cell(P, j, 1) + W[i][2] * cell(P, j, 2);
+                cell(p.rotate, i, j) = uu[i] * u2a[j] + vv[i] * v2a[j] + ww[i] * w2a[j];
             }
         }
         // Origin so that the hold point lands on the grip: O = G - W^T (s * hold).
         const float s = parent.world.scale * node->local.scale;
-        const float hold[3]{ tool.hold.x * s, tool.hold.y * s, tool.hold.z * s };
-        float origin[3]{ grip.x, grip.y, grip.z };
-        for (int j = 0; j < 3; ++j) {
-            origin[j] -= W[0][j] * hold[0] + W[1][j] * hold[1] + W[2][j] * hold[2];
+        p.origin = sub(grip, localToWorldDir(p.rotate, scaled(tool.hold, s)));
+        return p;
+    }
+
+    // Children's world transforms from their parent's (world rotation =
+    // local * parent, position = parent + parent R^T (scale * local)).
+    void updateChildrenWorld(RE::NiAVObject* object, const int depth) noexcept
+    {
+        auto* node = object ? object->IsNode() : nullptr;
+        if (!node || depth > 6) {
+            return;
+        }
+        auto& children = node->GetRuntimeData().children;
+        for (std::uint16_t index = 0; index < children.size(); ++index) {
+            auto* child = children[index].get();
+            if (!child) {
+                continue;
+            }
+            auto& P = object->world.rotate;
+            auto& L = child->local.rotate;
+            for (int i = 0; i < 3; ++i) {
+                for (int j = 0; j < 3; ++j) {
+                    cell(child->world.rotate, i, j) = cell(L, i, 0) * cell(P, 0, j) + cell(L, i, 1) * cell(P, 1, j) + cell(L, i, 2) * cell(P, 2, j);
+                }
+            }
+            const Vec3 t = add(fromNi(object->world.translate), localToWorldDir(P, scaled(fromNi(child->local.translate), object->world.scale)));
+            child->world.translate = { t.x, t.y, t.z };
+            child->world.scale = object->world.scale * child->local.scale;
+            updateChildrenWorld(child, depth + 1);
+        }
+    }
+
+    // Moves a tool to a placement: its local transform and, with world (the
+    // scene already updated this frame), its and its children's world
+    // transforms. Returns where its tip is, in world space.
+    Vec3 putTool(const Tool& tool, const Placement& p, const bool world) noexcept
+    {
+        auto* node = tool.node;
+        auto& parent = *node->parent;
+        // Local rotation = W * P^T.
+        auto& P = parent.world.rotate;
+        auto& L = node->local.rotate;
+        auto& W = const_cast<RE::NiMatrix3&>(p.rotate);
+        for (int i = 0; i < 3; ++i) {
+            for (int j = 0; j < 3; ++j) {
+                cell(L, i, j) = cell(W, i, 0) * cell(P, j, 0) + cell(W, i, 1) * cell(P, j, 1) + cell(W, i, 2) * cell(P, j, 2);
+            }
         }
         // Local translation = P * (O - parent t) / parent scale.
         const float ps = parent.world.scale > 1e-4f ? parent.world.scale : 1.0f;
-        const float d[3]{ origin[0] - parent.world.translate.x, origin[1] - parent.world.translate.y, origin[2] - parent.world.translate.z };
-        node->local.translate.x = (cell(P, 0, 0) * d[0] + cell(P, 0, 1) * d[1] + cell(P, 0, 2) * d[2]) / ps;
-        node->local.translate.y = (cell(P, 1, 0) * d[0] + cell(P, 1, 1) * d[1] + cell(P, 1, 2) * d[2]) / ps;
-        node->local.translate.z = (cell(P, 2, 0) * d[0] + cell(P, 2, 1) * d[1] + cell(P, 2, 2) * d[2]) / ps;
-        // Tip in world.
-        const float tipLocal[3]{ tool.tip.x * s, tool.tip.y * s, tool.tip.z * s };
-        Vec3 tip{ origin[0], origin[1], origin[2] };
-        tip.x += W[0][0] * tipLocal[0] + W[1][0] * tipLocal[1] + W[2][0] * tipLocal[2];
-        tip.y += W[0][1] * tipLocal[0] + W[1][1] * tipLocal[1] + W[2][1] * tipLocal[2];
-        tip.z += W[0][2] * tipLocal[0] + W[1][2] * tipLocal[1] + W[2][2] * tipLocal[2];
-        return tip;
+        const Vec3 t = scaled(worldToLocalDir(P, sub(p.origin, fromNi(parent.world.translate))), 1.0f / ps);
+        node->local.translate = { t.x, t.y, t.z };
+        const float s = parent.world.scale * node->local.scale;
+        if (world) {
+            node->world.rotate = p.rotate;
+            node->world.translate = { p.origin.x, p.origin.y, p.origin.z };
+            node->world.scale = s;
+            updateChildrenWorld(node, 0);
+        }
+        return add(p.origin, localToWorldDir(p.rotate, scaled(tool.tip, s)));
     }
 
     // ---- The visible fingers (FRIK body bones) ----
@@ -963,6 +1015,122 @@ namespace
         vrlockpick::grip::glue(left, target);
     }
 
+    // ---- Tools held rigidly in the hands ----
+    // A tool placed from the hand pose and the finger bones each frame mixed
+    // poses from different moments and wobbled in the hand on its own. Now
+    // its placement is measured once in the wrist's space (while the hand is
+    // still and the fingers have closed) and then carried by the wrist, as
+    // if fixed to it.
+    struct HeldTool
+    {
+        bool have{ false };
+        int frames{ 0 };
+        Vec3 lastAlong;
+        Vec3 lastSide;
+        RE::NiMatrix3 rotate;  // tool rows in the wrist's space
+        Vec3 translate;        // tool origin in the wrist's space
+    };
+    HeldTool g_heldPin;
+    HeldTool g_heldScrew;
+
+    void measureHeld(HeldTool& held, const bool left, const HandPose& hand, const Placement& p, const char* name) noexcept
+    {
+        ++held.frames;
+        const float moved = 2.0f - dot(held.lastAlong, hand.alongFingers) - dot(held.lastSide, hand.side);
+        held.lastAlong = hand.alongFingers;
+        held.lastSide = hand.side;
+        RE::NiTransform wrist;
+        // Fingers need a moment to close; then wait for a still hand (under
+        // about half a degree a frame), or take it anyway after 1.5 s.
+        if (held.frames < 30 || (moved > 4e-5f && held.frames < 135) || !wristBone(left, wrist)) {
+            return;
+        }
+        auto& Wr = wrist.rotate;
+        auto& W = const_cast<RE::NiMatrix3&>(p.rotate);
+        for (int i = 0; i < 3; ++i) {
+            for (int j = 0; j < 3; ++j) {
+                cell(held.rotate, i, j) = cell(W, i, 0) * cell(Wr, j, 0) + cell(W, i, 1) * cell(Wr, j, 1) + cell(W, i, 2) * cell(Wr, j, 2);
+            }
+        }
+        const float sc = wrist.scale > 1e-4f ? wrist.scale : 1.0f;
+        held.translate = scaled(worldToLocalDir(Wr, sub(p.origin, fromNi(wrist.translate))), 1.0f / sc);
+        held.have = true;
+        char message[200]{};
+        std::snprintf(message, sizeof(message), "  %s fixed in the hand after %d frames: at (%.1f, %.1f, %.1f) from the wrist", name, held.frames,
+            held.translate.x, held.translate.y, held.translate.z);
+        vrlockpick::runtime::logNote(message);
+    }
+
+    bool heldPlacement(const HeldTool& held, const bool left, Placement& p) noexcept
+    {
+        RE::NiTransform wrist;
+        if (!held.have || !wristBone(left, wrist)) {
+            return false;
+        }
+        auto& Wr = wrist.rotate;
+        auto& R = const_cast<RE::NiMatrix3&>(held.rotate);
+        for (int i = 0; i < 3; ++i) {
+            for (int j = 0; j < 3; ++j) {
+                cell(p.rotate, i, j) = cell(R, i, 0) * cell(Wr, 0, j) + cell(R, i, 1) * cell(Wr, 1, j) + cell(R, i, 2) * cell(Wr, 2, j);
+            }
+        }
+        p.origin = add(fromNi(wrist.translate), localToWorldDir(Wr, scaled(held.translate, wrist.scale)));
+        return true;
+    }
+
+    // Places a tool still in the hand; returns its tip in world space.
+    Vec3 holdTool(const Tool& tool, HeldTool& held, const bool left, const bool pinch, const HandPose& hand, const HoldPose& pose, const char* name) noexcept
+    {
+        Placement p;
+        if (!heldPlacement(held, left, p)) {
+            Vec3 fingers;
+            const bool haveFingers = fingerHold(left, pinch, fingers);
+            p = toolInHand(tool, hand, pose, haveFingers ? &fingers : nullptr);
+            measureHeld(held, left, hand, p, name);
+        }
+        return putTool(tool, p, false);
+    }
+
+    // The pin hand's controller: a short buzz when the pin reaches the sweet
+    // spot, then a faint one while it stays there.
+    void sweetSpotBuzz(const RE::LockpickingMenu& menu) noexcept
+    {
+        auto& s = g_session;
+        if (!g_settings.sweetSpotBuzz || !s.pinDocked || menu.animating) {
+            s.inSweetSpot = false;
+            return;
+        }
+        const bool inside = std::fabs(menu.pickAngle - menu.sweetSpotCenter) <= menu.sweetSpotLength * 0.5f;
+        if (inside && !s.inSweetSpot) {
+            s.buzzFrames = 9;  // about a tenth of a second
+            vrlockpick::runtime::logInfo("Pin on the sweet spot: buzz");
+        }
+        s.inSweetSpot = inside;
+        if (s.buzzFrames > 0) {
+            --s.buzzFrames;
+            vrlockpick::haptics::pulse(g_settings.leftHandPick, 3000);
+        } else if (inside && g_settings.sweetSpotHoldBuzz > 0.0f) {
+            vrlockpick::haptics::pulse(g_settings.leftHandPick, static_cast<unsigned short>(std::clamp(g_settings.sweetSpotHoldBuzz, 0.0f, 1.0f) * 3000.0f));
+        }
+    }
+
+    // FRIK's frame end (every bone final): the held tools again, on this
+    // frame's wrists, world transforms included.
+    void onHandsFinal() noexcept
+    {
+        const auto& s = g_session;
+        if (!s.active || !g_settings.toolsInHands || !s.toolsPrepared) {
+            return;
+        }
+        Placement p;
+        if (!s.pinDocked && g_pin.node && heldPlacement(g_heldPin, g_settings.leftHandPick, p)) {
+            (void)putTool(g_pin, p, true);
+        }
+        if (!s.screwDocked && g_screw.node && heldPlacement(g_heldScrew, !g_settings.leftHandPick, p)) {
+            (void)putTool(g_screw, p, true);
+        }
+    }
+
     // After the game's frame: tools not yet at the keyhole follow the hands.
     void updateToolsInHands(RE::LockpickingMenu& menu) noexcept
     {
@@ -972,6 +1140,8 @@ namespace
         }
         if (!s.toolsPrepared) {
             s.toolsPrepared = true;
+            g_heldPin = HeldTool{};
+            g_heldScrew = HeldTool{};
             // Hold points along the tools, from the reference.
             s.pinDocked = !prepareTool(g_pin, g_pinNode, 0.79f, "pin");
             s.screwDocked = !prepareTool(g_screw, g_screwNode, 0.79f, "screwdriver");
@@ -1002,9 +1172,7 @@ namespace
             }
         }
         if (!s.pinDocked && readHand(g_settings.leftHandPick, hand)) {
-            Vec3 fingers;
-            const bool haveFingers = fingerHold(g_settings.leftHandPick, true, fingers);
-            const Vec3 tip = placeInHand(g_pin, hand, kPinHold, haveFingers ? &fingers : nullptr);
+            const Vec3 tip = holdTool(g_pin, g_heldPin, g_settings.leftHandPick, true, hand, kPinHold, "pin");
             const Vec3 d = sub(tip, center);
             if (std::sqrt(dot(d, d)) < g_settings.dockDistance) {
                 s.pinDocked = true;
@@ -1015,9 +1183,7 @@ namespace
             }
         }
         if (!s.screwDocked && readHand(!g_settings.leftHandPick, hand)) {
-            Vec3 fingers;
-            const bool haveFingers = fingerHold(!g_settings.leftHandPick, false, fingers);
-            const Vec3 tip = placeInHand(g_screw, hand, kScrewHold, haveFingers ? &fingers : nullptr);
+            const Vec3 tip = holdTool(g_screw, g_heldScrew, !g_settings.leftHandPick, false, hand, kScrewHold, "screwdriver");
             const Vec3 d = sub(tip, center);
             if (std::sqrt(dot(d, d)) < g_settings.dockDistance) {
                 s.screwDocked = true;
@@ -1271,6 +1437,7 @@ namespace
             glueHand(g_settings.leftHandPick, s.pinDocked, g_pin, true, kPinHold);
             glueHand(!g_settings.leftHandPick, s.screwDocked, g_screw, false, kScrewHold);
         }
+        sweetSpotBuzz(menu);
         const bool changed = menu.turningLock != s.lastTurning || menu.picksBroken != s.lastPicksBroken;
         if (changed) {
             logMenuState(menu.picksBroken != s.lastPicksBroken ? "Pick broke" : (menu.turningLock ? "Lock turn started" : "Lock turn stopped"), menu);
@@ -1411,6 +1578,7 @@ namespace
         if (!ready) {
             readSettings();
             findTurnLock();
+            vrlockpick::grip::onHandsFinal(onHandsFinal);
             if (auto* ui = RE::UI::GetSingleton()) {
                 ui->RegisterSink<RE::MenuOpenCloseEvent>(&g_menuWatcher);
                 vrlockpick::runtime::logNote("Watching for the lockpicking menu (build " VRLOCKPICK_BUILD ")");
