@@ -252,10 +252,12 @@ namespace
         float armPickAngle{ 0.0f };
         float pinchDistance{ 0.0f };
         float screwAngle{ 0.0f };
-        // Where the hand was around the keyhole when the screwdriver went in:
-        // the turn counts from there, not from the screwdriver's rest.
+        // Where the screwdriver hand was when the screwdriver went in, how
+        // far from the keyhole axis, and the axis turned toward the player.
         bool haveScrewZero{ false };
-        float screwZero{ 0.0f };
+        Vec3 screwStart;
+        float screwRadius{ 0.0f };
+        Vec3 screwView;
         bool loggedFingers{ false };
         bool inSweetSpot{ false };
         int buzzFrames{ 0 };
@@ -1321,6 +1323,7 @@ namespace
     // screwdriver rests, clockwise as seen from the player's side.
     bool screwAngleTowardHand(float& angle) noexcept
     {
+        auto& s = g_session;
         HandPose hand;
         Vec3 center, axis;
         const bool left = !g_settings.leftHandPick;
@@ -1328,17 +1331,27 @@ namespace
             return false;
         }
         const Vec3 grip = add(holdPoint(left, false, hand, kScrewHold), handShift(left));
-        Vec3 across;
-        if (acrossAxis(grip, center, axis, across) < 3.0f) {
-            return false;
+        if (!s.haveScrewZero) {
+            Vec3 across;
+            const float distance = acrossAxis(grip, center, axis, across);
+            if (distance < 3.0f) {
+                return false;
+            }
+            s.haveScrewZero = true;
+            s.screwStart = grip;
+            s.screwRadius = std::max(distance, 12.0f);
+            s.screwView = dot(axis, sub(grip, center)) >= 0.0f ? axis : scaled(axis, -1.0f);
         }
-        // Positive turns are counter-clockwise looking against this axis.
-        const Vec3 view = dot(axis, sub(grip, center)) >= 0.0f ? axis : scaled(axis, -1.0f);
-        const Vec3 rest = acrossOnly(localToWorldDir(g_pinNode->parent->world.rotate, g_screw.restDir), axis);
-        if (dot(rest, rest) < 1e-4f) {
-            return false;
-        }
-        angle = -orbitDegrees(rest, across, view) * g_settings.screwSign;
+        const Vec3 rest = normalized(acrossOnly(localToWorldDir(g_pinNode->parent->world.rotate, g_screw.restDir), axis));
+        // A quarter turn clockwise (as the player sees it) from where the
+        // handle rests: the way it goes down.
+        const Vec3 down = scaled(cross(rest, s.screwView), g_settings.screwSign);
+        // Like pushing a lever down: how far the hand has dropped that way,
+        // as the angle a handle that long would have turned (dropping by
+        // its whole length is a quarter turn). Sideways and toward the lock
+        // don't count, so the hand can't lose its way past the keyhole.
+        const float drop = dot(sub(grip, s.screwStart), down);
+        angle = std::asin(std::clamp(drop / s.screwRadius, -1.0f, 1.0f)) * 180.0f / kPi;
         return true;
     }
 
@@ -1352,11 +1365,7 @@ namespace
         float swing = 0.0f;
         const bool aimed = aimScrew && screwAngleTowardHand(swing);
         if (aimed) {
-            if (!s.haveScrewZero) {
-                s.haveScrewZero = true;
-                s.screwZero = swing;
-            }
-            s.screwAngle = wrapDegrees(swing - s.screwZero);
+            s.screwAngle = swing;
         }
         const bool haveScrew = aimScrew ? aimed : g_settings.screwTwist ? s.haveTwistReference : s.haveWrenchOrbitReference;
         if (g_settings.turnWithHand && s.haveWrench && g_turnLock && haveScrew && s.screwDocked) {
