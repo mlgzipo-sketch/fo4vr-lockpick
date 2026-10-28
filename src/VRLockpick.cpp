@@ -68,7 +68,11 @@ namespace
         // The pin hand's controller buzzes when the pin reaches the spot that
         // opens the lock, and softly while it stays there (0 = off).
         bool sweetSpotBuzz{ true };
-        float sweetSpotHoldBuzz{ 0.3f };
+        float sweetSpotHoldBuzz{ 0.0f };
+        // Like a safe's dial: the pin hand feels a light tick every this
+        // many degrees the pin moves, stronger the closer it is to the spot,
+        // and a sharp click on reaching it (0 = no ticks, only the click).
+        float clickStepDegrees{ 3.0f };
         // The screwdriver hand buzzes while the lock is turned as far as the
         // pin lets it (the pin bending); a broken pin jolts both hands.
         bool lockStrainBuzz{ true };
@@ -182,6 +186,8 @@ namespace
                     g_settings.screwSign = value;
                 } else if (key == "bSweetSpotBuzz") {
                     g_settings.sweetSpotBuzz = value != 0.0f;
+                } else if (key == "fClickStepDegrees") {
+                    g_settings.clickStepDegrees = value;
                 } else if (key == "fSweetSpotHoldBuzz") {
                     g_settings.sweetSpotHoldBuzz = value;
                 } else if (key == "bLockStrainBuzz") {
@@ -266,6 +272,7 @@ namespace
         bool loggedFingers{ false };
         bool inSweetSpot{ false };
         int buzzFrames{ 0 };
+        float lastTickAngle{ 0.0f };
         int breakBuzzFrames{ 0 };
         // Screwdriver twist around the keyhole axis.
         bool haveTwistReference{ false };
@@ -1200,17 +1207,31 @@ namespace
         auto& s = g_session;
         if (!g_settings.sweetSpotBuzz || !s.pinDocked || menu.animating) {
             s.inSweetSpot = false;
+            s.lastTickAngle = menu.pickAngle;
             return;
         }
-        const bool inside = std::fabs(menu.pickAngle - menu.sweetSpotCenter) <= menu.sweetSpotLength * 0.5f;
+        const float half = menu.sweetSpotLength * 0.5f;
+        const float off = std::fabs(menu.pickAngle - menu.sweetSpotCenter);
+        const bool inside = off <= half;
         if (inside && !s.inSweetSpot) {
-            s.buzzFrames = 9;  // about a tenth of a second
-            vrlockpick::runtime::logInfo("Pin on the sweet spot: buzz");
+            s.buzzFrames = 3;  // a sharp click
+            vrlockpick::runtime::logInfo("Pin on the sweet spot: click");
         }
         s.inSweetSpot = inside;
         if (s.buzzFrames > 0) {
             --s.buzzFrames;
-            vrlockpick::haptics::pulse(g_settings.leftHandPick, 3000);
+            vrlockpick::haptics::pulse(g_settings.leftHandPick, 3999);
+            s.lastTickAngle = menu.pickAngle;
+            return;
+        }
+        // Detent ticks while the pin moves: faint far away, firmer within
+        // the game's partial zone around the spot.
+        const float step = g_settings.clickStepDegrees;
+        if (step > 0.0f && std::fabs(menu.pickAngle - s.lastTickAngle) >= step) {
+            s.lastTickAngle = menu.pickAngle;
+            const float zone = std::max(menu.partialPickLength, half + 1.0f);
+            const float near = std::clamp(1.0f - (off - half) / zone, 0.0f, 1.0f);
+            vrlockpick::haptics::pulse(g_settings.leftHandPick, static_cast<unsigned short>(200.0f + near * near * 1600.0f));
         } else if (inside && g_settings.sweetSpotHoldBuzz > 0.0f) {
             vrlockpick::haptics::pulse(g_settings.leftHandPick, static_cast<unsigned short>(std::clamp(g_settings.sweetSpotHoldBuzz, 0.0f, 1.0f) * 3000.0f));
         }
