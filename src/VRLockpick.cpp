@@ -977,6 +977,24 @@ namespace
         return sub(fromNi(controller.translate), fromNi(wrist.translate));
     }
 
+    // ---- Tools held rigidly in the hands ----
+    // A tool placed from the hand pose and the finger bones each frame mixed
+    // poses from different moments and wobbled in the hand on its own. Now
+    // its placement is measured once in the wrist's space (while the hand is
+    // still and the fingers have closed) and then carried by the wrist, as
+    // if fixed to it.
+    struct HeldTool
+    {
+        bool have{ false };
+        int frames{ 0 };
+        Vec3 lastAlong;
+        Vec3 lastSide;
+        RE::NiMatrix3 rotate;  // tool rows in the wrist's space
+        Vec3 translate;        // tool origin in the wrist's space
+    };
+    HeldTool g_heldPin;
+    HeldTool g_heldScrew;
+
     // Holds the visible hand with its fingers on the tool's hold point,
     // turned as the controller is; lets go if the controller is too far,
     // and takes the tool again once it is back within most of that.
@@ -991,8 +1009,25 @@ namespace
             vrlockpick::grip::unglue(left);
             return;
         }
-        const Vec3 fingers = sub(holdPoint(left, pinch, hand, pose), fromNi(wrist.translate));
-        Vec3 at = sub(nodePointWorld(*tool.node, tool.hold), fingers);
+        // The wrist where it held the tool before the lock (the tool's
+        // place in the wrist's space, turned around), so the hand holds it
+        // the same way; else the fingers moved onto the tool's hold point.
+        const HeldTool& held = pinch ? g_heldPin : g_heldScrew;
+        RE::NiMatrix3 turned = controller.rotate;
+        Vec3 at;
+        if (held.have) {
+            auto& T = tool.node->world.rotate;
+            auto& R = const_cast<RE::NiMatrix3&>(held.rotate);
+            for (int i = 0; i < 3; ++i) {
+                for (int j = 0; j < 3; ++j) {
+                    cell(turned, i, j) = cell(R, 0, i) * cell(T, 0, j) + cell(R, 1, i) * cell(T, 1, j) + cell(R, 2, i) * cell(T, 2, j);
+                }
+            }
+            at = sub(fromNi(tool.node->world.translate), localToWorldDir(turned, scaled(held.translate, wrist.scale)));
+        } else {
+            const Vec3 fingers = sub(holdPoint(left, pinch, hand, pose), fromNi(wrist.translate));
+            at = sub(nodePointWorld(*tool.node, tool.hold), fingers);
+        }
         const Vec3 pull = sub(at, fromNi(controller.translate));
         const float reach = vrlockpick::grip::glued(left) ? g_settings.glueMaxDistance : g_settings.glueMaxDistance * 0.7f;
         if (std::sqrt(dot(pull, pull)) > reach) {
@@ -1011,27 +1046,10 @@ namespace
         }
         last = at;
         RE::NiTransform target = controller;
+        target.rotate = turned;
         target.translate = { at.x, at.y, at.z };
         vrlockpick::grip::glue(left, target);
     }
-
-    // ---- Tools held rigidly in the hands ----
-    // A tool placed from the hand pose and the finger bones each frame mixed
-    // poses from different moments and wobbled in the hand on its own. Now
-    // its placement is measured once in the wrist's space (while the hand is
-    // still and the fingers have closed) and then carried by the wrist, as
-    // if fixed to it.
-    struct HeldTool
-    {
-        bool have{ false };
-        int frames{ 0 };
-        Vec3 lastAlong;
-        Vec3 lastSide;
-        RE::NiMatrix3 rotate;  // tool rows in the wrist's space
-        Vec3 translate;        // tool origin in the wrist's space
-    };
-    HeldTool g_heldPin;
-    HeldTool g_heldScrew;
 
     void measureHeld(HeldTool& held, const bool left, const HandPose& hand, const Placement& p, const char* name) noexcept
     {
