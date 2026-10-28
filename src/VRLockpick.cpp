@@ -70,7 +70,7 @@ namespace
         bool sweetSpotBuzz{ true };
         float sweetSpotHoldBuzz{ 0.3f };
         bool glueHands{ true };
-        float glueMaxDistance{ 20.0f };
+        float glueMaxDistance{ 45.0f };
         // The tools start in the hands; bringing a tool's tip this close to
         // the keyhole puts it in place.
         bool toolsInHands{ true };
@@ -759,7 +759,7 @@ namespace
 
     // A tool in the hand as in the reference: its hold point at the grip,
     // pointing to its tip and turned so its keyhole axis matches.
-    Placement toolInHand(const Tool& tool, const HandPose& hand, const HoldPose& pose, const Vec3* fingers) noexcept
+    Placement toolInHand(const Tool& tool, const HandPose& hand, const HoldPose& pose, const Vec3* fingers, const Vec3* toTip) noexcept
     {
         auto* node = tool.node;
         auto& parent = *node->parent;
@@ -776,7 +776,7 @@ namespace
         Vec3 v = sub(tool.side, { u.x * dot(tool.side, u), u.y * dot(tool.side, u), u.z * dot(tool.side, u) });
         v = normalized(v);
         const Vec3 w = cross(u, v);
-        const Vec3 u2 = normalized(toWorld(pose.toTip));
+        const Vec3 u2 = normalized(toTip ? *toTip : toWorld(pose.toTip));
         const Vec3 side = toWorld(pose.keyhole);
         Vec3 v2 = sub(side, { u2.x * dot(side, u2), u2.y * dot(side, u2), u2.z * dot(side, u2) });
         v2 = normalized(v2);
@@ -1085,7 +1085,14 @@ namespace
         if (!heldPlacement(held, left, p)) {
             Vec3 fingers;
             const bool haveFingers = fingerHold(left, pinch, fingers);
-            p = toolInHand(tool, hand, pose, haveFingers ? &fingers : nullptr);
+            // A screwdriver lies across the fist, its shaft out past the index.
+            Vec3 index, pinky, across;
+            const bool haveAcross = !pinch && fingerBone(left, "Finger21", index) &&
+                                    (fingerBone(left, "Finger51", pinky) || fingerBone(left, "Finger41", pinky));
+            if (haveAcross) {
+                across = normalized(sub(index, pinky));
+            }
+            p = toolInHand(tool, hand, pose, haveFingers ? &fingers : nullptr, haveAcross ? &across : nullptr);
             measureHeld(held, left, hand, p, name);
         }
         return putTool(tool, p, false);
