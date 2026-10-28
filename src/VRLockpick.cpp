@@ -243,6 +243,10 @@ namespace
         float armPickAngle{ 0.0f };
         float pinchDistance{ 0.0f };
         float screwAngle{ 0.0f };
+        // Where the hand was around the keyhole when the screwdriver went in:
+        // the turn counts from there, not from the screwdriver's rest.
+        bool haveScrewZero{ false };
+        float screwZero{ 0.0f };
         bool loggedFingers{ false };
         // Screwdriver twist around the keyhole axis.
         bool haveTwistReference{ false };
@@ -940,6 +944,11 @@ namespace
         const Vec3 pull = sub(at, fromNi(controller.translate));
         const float reach = vrlockpick::grip::glued(left) ? g_settings.glueMaxDistance : g_settings.glueMaxDistance * 0.7f;
         if (std::sqrt(dot(pull, pull)) > reach) {
+            if (vrlockpick::grip::glued(left)) {
+                char message[120]{};
+                std::snprintf(message, sizeof(message), "  %s hand let go of the tool: controller %.1f away", left ? "left" : "right", std::sqrt(dot(pull, pull)));
+                vrlockpick::runtime::logInfo(message);
+            }
             vrlockpick::grip::unglue(left);
             return;
         }
@@ -1015,6 +1024,7 @@ namespace
                 g_screw.node->local = g_screw.rest;
                 s.haveWrenchOrbitReference = false;
                 s.haveTwistReference = false;
+                s.haveScrewZero = false;
                 vrlockpick::runtime::logInfo("Screwdriver in the keyhole");
             }
         }
@@ -1079,7 +1089,16 @@ namespace
         // Screwdriver: the lock follows the hand, a quarter circle = 90.
         // Swinging around the keyhole (default) or twisting in place.
         const bool aimScrew = g_settings.screwPointsAtHand && g_settings.toolsInHands && !g_settings.screwTwist;
-        const bool haveScrew = aimScrew ? screwAngleTowardHand(s.screwAngle) : g_settings.screwTwist ? s.haveTwistReference : s.haveWrenchOrbitReference;
+        float swing = 0.0f;
+        const bool aimed = aimScrew && screwAngleTowardHand(swing);
+        if (aimed) {
+            if (!s.haveScrewZero) {
+                s.haveScrewZero = true;
+                s.screwZero = swing;
+            }
+            s.screwAngle = wrapDegrees(swing - s.screwZero);
+        }
+        const bool haveScrew = aimScrew ? aimed : g_settings.screwTwist ? s.haveTwistReference : s.haveWrenchOrbitReference;
         if (g_settings.turnWithHand && s.haveWrench && g_turnLock && haveScrew && s.screwDocked) {
             const float swung = aimScrew ? std::max(s.screwAngle, 0.0f) : std::fabs(g_settings.screwTwist ? s.wrenchTwist : s.wrenchOrbit);
             const float target = swung * g_settings.screwLockDegreesPerTwist;
