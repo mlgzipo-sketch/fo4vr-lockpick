@@ -69,6 +69,9 @@ namespace
         // opens the lock, and softly while it stays there (0 = off).
         bool sweetSpotBuzz{ true };
         float sweetSpotHoldBuzz{ 0.3f };
+        // The screwdriver hand buzzes while the lock is turned as far as the
+        // pin lets it (the pin bending); a broken pin jolts both hands.
+        bool lockStrainBuzz{ true };
         bool glueHands{ true };
         float glueMaxDistance{ 45.0f };
         // The tools start in the hands; bringing a tool's tip this close to
@@ -181,6 +184,8 @@ namespace
                     g_settings.sweetSpotBuzz = value != 0.0f;
                 } else if (key == "fSweetSpotHoldBuzz") {
                     g_settings.sweetSpotHoldBuzz = value;
+                } else if (key == "bLockStrainBuzz") {
+                    g_settings.lockStrainBuzz = value != 0.0f;
                 } else if (key == "bGlueHands") {
                     g_settings.glueHands = value != 0.0f;
                 } else if (key == "fGlueMaxDistance") {
@@ -261,6 +266,7 @@ namespace
         bool loggedFingers{ false };
         bool inSweetSpot{ false };
         int buzzFrames{ 0 };
+        int breakBuzzFrames{ 0 };
         // Screwdriver twist around the keyhole axis.
         bool haveTwistReference{ false };
         bool twistUsesFingers{ false };
@@ -1210,6 +1216,32 @@ namespace
         }
     }
 
+    // What the hands feel from the lock: the screwdriver hand buzzes while
+    // the lock is stopped by a pin in the wrong place (the game bends the pin
+    // then), and a broken pin jolts both. The next pin starts in the hand.
+    void lockFeel(const RE::LockpickingMenu& menu) noexcept
+    {
+        auto& s = g_session;
+        if (menu.picksBroken != s.lastPicksBroken) {
+            s.breakBuzzFrames = 18;
+            if (g_settings.toolsInHands && s.toolsPrepared && g_pin.node) {
+                s.pinDocked = false;
+                s.pinGrabbed = false;
+                vrlockpick::runtime::logInfo("Pin broke: the next one starts in the hand");
+            }
+        }
+        if (!g_settings.lockStrainBuzz) {
+            return;
+        }
+        if (s.breakBuzzFrames > 0) {
+            --s.breakBuzzFrames;
+            vrlockpick::haptics::pulse(true, 3999);
+            vrlockpick::haptics::pulse(false, 3999);
+        } else if (menu.turningLock && menu.lockDamagePickAngle < 89.0f && menu.lockAngle >= menu.lockDamagePickAngle - 1.0f) {
+            vrlockpick::haptics::pulse(!g_settings.leftHandPick, 1800);
+        }
+    }
+
     // FRIK's frame end (every bone final): the held tools again, on this
     // frame's hands, world transforms included.
     void onHandsFinal() noexcept
@@ -1541,6 +1573,7 @@ namespace
             glueHand(!g_settings.leftHandPick, s.screwDocked, g_screw, g_heldScrew);
         }
         sweetSpotBuzz(menu);
+        lockFeel(menu);
         const bool changed = menu.turningLock != s.lastTurning || menu.picksBroken != s.lastPicksBroken;
         if (changed) {
             logMenuState(menu.picksBroken != s.lastPicksBroken ? "Pick broke" : (menu.turningLock ? "Lock turn started" : "Lock turn stopped"), menu);
