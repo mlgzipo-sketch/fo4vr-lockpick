@@ -73,6 +73,13 @@ namespace
         // many degrees the pin moves, stronger the closer it is to the spot,
         // and a sharp click on reaching it (0 = no ticks, only the click).
         float clickStepDegrees{ 3.0f };
+        // Screwdriver: moving the hand left (as you look at the lock) this
+        // far, in game units, turns the lock all the way.
+        float screwTurnDistance{ 20.0f };
+        // Moves a tool in the hand, in centimetres along the hand: X toward
+        // the fingertips, Y out of the back of the hand, Z sideways.
+        float pinOffset[3]{};
+        float screwOffset[3]{};
         // The screwdriver hand buzzes while the lock is turned as far as the
         // pin lets it (the pin bending); a broken pin jolts both hands.
         bool lockStrainBuzz{ true };
@@ -186,6 +193,12 @@ namespace
                     g_settings.screwSign = value;
                 } else if (key == "bSweetSpotBuzz") {
                     g_settings.sweetSpotBuzz = value != 0.0f;
+                } else if (key == "fScrewTurnDistance") {
+                    g_settings.screwTurnDistance = value;
+                } else if (key == "fPinOffsetX" || key == "fPinOffsetY" || key == "fPinOffsetZ") {
+                    g_settings.pinOffset[key.back() - 'X'] = value;
+                } else if (key == "fScrewOffsetX" || key == "fScrewOffsetY" || key == "fScrewOffsetZ") {
+                    g_settings.screwOffset[key.back() - 'X'] = value;
                 } else if (key == "fClickStepDegrees") {
                     g_settings.clickStepDegrees = value;
                 } else if (key == "fSweetSpotHoldBuzz") {
@@ -520,6 +533,7 @@ namespace
         auto& s = g_session;
         s = Session{};
         s.active = true;
+        readSettings();  // changes to the ini apply from the next lock
         s.rockFramesAtOpen = g_rockFrames;
         s.lastLog = Clock::now();
         logMenuState("Lockpicking opened", menu);
@@ -1166,7 +1180,7 @@ namespace
         vrlockpick::grip::glue(left, target);
     }
 
-    void measureHeld(HeldTool& held, const HandPose& hand, const Placement& p, const char* name) noexcept
+    void measureHeld(HeldTool& held, const HandPose& hand, const Placement& p, const float* offsetCm, const char* name) noexcept
     {
         ++held.frames;
         const float moved = 2.0f - dot(held.lastAlong, hand.alongFingers) - dot(held.lastSide, hand.side);
@@ -1178,6 +1192,8 @@ namespace
             return;
         }
         held.inHand = relativeTo(handFrame(hand), p);
+        // The user's own nudge (centimetres; about 0.7 game units each).
+        held.inHand.origin = add(held.inHand.origin, scaled({ offsetCm[0], offsetCm[1], offsetCm[2] }, 0.7f));
         held.have = true;
         char message[200]{};
         std::snprintf(message, sizeof(message), "  %s fixed in the hand after %d frames: at (%.1f, %.1f, %.1f) in the hand frame", name, held.frames,
@@ -1195,7 +1211,7 @@ namespace
             Vec3 fingers;
             const bool haveFingers = fingerHold(left, pinch, fingers);
             p = toolInHand(tool, hand, pose, haveFingers ? &fingers : nullptr, nullptr);
-            measureHeld(held, hand, p, name);
+            measureHeld(held, hand, p, pinch ? g_settings.pinOffset : g_settings.screwOffset, name);
         }
         return putTool(tool, p, false);
     }
@@ -1396,15 +1412,12 @@ namespace
             s.screwView = dot(axis, sub(grip, center)) >= 0.0f ? axis : scaled(axis, -1.0f);
         }
         const Vec3 rest = normalized(acrossOnly(localToWorldDir(g_pinNode->parent->world.rotate, g_screw.restDir), axis));
-        // A quarter turn clockwise (as the player sees it) from where the
-        // handle rests: the way it goes down.
-        const Vec3 down = scaled(cross(rest, s.screwView), g_settings.screwSign);
-        // Like pushing a lever down: how far the hand has dropped that way,
-        // as the angle a handle that long would have turned (dropping by
-        // its whole length is a quarter turn). Sideways and toward the lock
-        // don't count, so the hand can't lose its way past the keyhole.
-        const float drop = dot(sub(grip, s.screwStart), down);
-        angle = std::asin(std::clamp(drop / s.screwRadius, -1.0f, 1.0f)) * 180.0f / kPi;
+        // The handle rests to the right of the keyhole: moving the hand to
+        // the left (toward and past the keyhole) turns the lock, the whole
+        // way after fScrewTurnDistance. Up, down and toward the lock don't
+        // count.
+        const float moved = -dot(sub(grip, s.screwStart), rest) * g_settings.screwSign;
+        angle = std::clamp(moved / std::max(g_settings.screwTurnDistance, 1.0f), -1.0f, 1.0f) * 90.0f;
         return true;
     }
 
