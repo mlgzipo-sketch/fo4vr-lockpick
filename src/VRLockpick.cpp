@@ -75,11 +75,14 @@ namespace
         float clickStepDegrees{ 3.0f };
         // Screwdriver: moving the hand left (as you look at the lock) this
         // far, in game units, turns the lock all the way.
-        float screwTurnDistance{ 20.0f };
+        float screwTurnDistance{ 10.0f };
         // Moves a tool in the hand, in centimetres along the hand: X toward
         // the fingertips, Y out of the back of the hand, Z sideways.
         float pinOffset[3]{};
         float screwOffset[3]{};
+        // The same, for how the hand holds a tool once it is in the lock.
+        float pinLockOffset[3]{};
+        float screwLockOffset[3]{};
         // The screwdriver hand buzzes while the lock is turned as far as the
         // pin lets it (the pin bending); a broken pin jolts both hands.
         bool lockStrainBuzz{ true };
@@ -199,6 +202,10 @@ namespace
                     g_settings.pinOffset[key.back() - 'X'] = value;
                 } else if (key == "fScrewOffsetX" || key == "fScrewOffsetY" || key == "fScrewOffsetZ") {
                     g_settings.screwOffset[key.back() - 'X'] = value;
+                } else if (key == "fPinLockOffsetX" || key == "fPinLockOffsetY" || key == "fPinLockOffsetZ") {
+                    g_settings.pinLockOffset[key.back() - 'X'] = value;
+                } else if (key == "fScrewLockOffsetX" || key == "fScrewLockOffsetY" || key == "fScrewLockOffsetZ") {
+                    g_settings.screwLockOffset[key.back() - 'X'] = value;
                 } else if (key == "fClickStepDegrees") {
                     g_settings.clickStepDegrees = value;
                 } else if (key == "fSweetSpotHoldBuzz") {
@@ -1100,8 +1107,15 @@ namespace
             return;
         }
         const Placement frame = handFrame(hand);
-        record.inWand = relativeTo(fromTransform(wand), frame);
-        record.wristInHand = relativeTo(frame, fromTransform(wrist));
+        // Positions averaged over frames: single readings are noisy and
+        // made the held hand wander from lock to lock.
+        const Placement inWand = relativeTo(fromTransform(wand), frame);
+        const Placement wristInHand = relativeTo(frame, fromTransform(wrist));
+        const float keep = record.have ? 0.9f : 0.0f;
+        record.inWand.rotate = inWand.rotate;
+        record.inWand.origin = add(scaled(record.inWand.origin, keep), scaled(inWand.origin, 1.0f - keep));
+        record.wristInHand.rotate = wristInHand.rotate;
+        record.wristInHand.origin = add(scaled(record.wristInHand.origin, keep), scaled(wristInHand.origin, 1.0f - keep));
         record.have = true;
     }
 
@@ -1153,6 +1167,9 @@ namespace
         const Placement toolHere = carriedBy(frame, held.inHand);
         const Vec3 holdHere = add(toolHere.origin, localToWorldDir(toolHere.rotate, scaled(tool.hold, tool.node->world.scale)));
         frame.origin = sub(nodePointWorld(*tool.node, tool.hold), holdHere);
+        // The user's nudge moves the tool in the hand, so the hand the other way.
+        const float* nudge = &tool == &g_pin ? g_settings.pinLockOffset : g_settings.screwLockOffset;
+        frame.origin = sub(frame.origin, localToWorldDir(frame.rotate, scaled({ nudge[0], nudge[1], nudge[2] }, 0.7f)));
 
         const Vec3 pull = sub(frame.origin, controlled.origin);
         const float reach = vrlockpick::grip::glued(left) ? g_settings.glueMaxDistance : g_settings.glueMaxDistance * 0.7f;
@@ -1180,27 +1197,6 @@ namespace
         vrlockpick::grip::glue(left, target);
     }
 
-    void measureHeld(HeldTool& held, const HandPose& hand, const Placement& p, const float* offsetCm, const char* name) noexcept
-    {
-        ++held.frames;
-        const float moved = 2.0f - dot(held.lastAlong, hand.alongFingers) - dot(held.lastSide, hand.side);
-        held.lastAlong = hand.alongFingers;
-        held.lastSide = hand.side;
-        // Fingers need a moment to close; then wait for a still hand (under
-        // about half a degree a frame), or take it anyway after 1.5 s.
-        if (held.frames < 30 || (moved > 4e-5f && held.frames < 135)) {
-            return;
-        }
-        held.inHand = relativeTo(handFrame(hand), p);
-        // The user's own nudge (centimetres; about 0.7 game units each).
-        held.inHand.origin = add(held.inHand.origin, scaled({ offsetCm[0], offsetCm[1], offsetCm[2] }, 0.7f));
-        held.have = true;
-        char message[200]{};
-        std::snprintf(message, sizeof(message), "  %s fixed in the hand after %d frames: at (%.1f, %.1f, %.1f) in the hand frame", name, held.frames,
-            held.inHand.origin.x, held.inHand.origin.y, held.inHand.origin.z);
-        vrlockpick::runtime::logNote(message);
-    }
-
     // Places a tool still in the hand; returns its tip in world space.
     Vec3 holdTool(const Tool& tool, HeldTool& held, const bool left, const bool pinch, const HandPose& hand, const HoldPose& pose, const char* name) noexcept
     {
@@ -1208,10 +1204,20 @@ namespace
         if (held.have) {
             p = carriedBy(handFrame(hand), held.inHand);
         } else {
-            Vec3 fingers;
-            const bool haveFingers = fingerHold(left, pinch, fingers);
-            p = toolInHand(tool, hand, pose, haveFingers ? &fingers : nullptr, nullptr);
-            measureHeld(held, hand, p, pinch ? g_settings.pinOffset : g_settings.screwOffset, name);
+            // Always the same place in the hand (where the closed fingers
+            // were, measured over many locks), plus the user's nudge: no
+            // measuring each time, which moved the tool from lock to lock.
+            const Vec3 base = pinch ? Vec3{ 5.2f, -5.3f, 0.6f } : Vec3{ 6.4f, -3.4f, 4.4f };
+            const float* nudge = pinch ? g_settings.pinOffset : g_settings.screwOffset;
+            const Vec3 local = add(base, scaled({ nudge[0], nudge[1], nudge[2] }, 0.7f));
+            const Placement frame = handFrame(hand);
+            const Vec3 grip = add(frame.origin, localToWorldDir(frame.rotate, local));
+            p = toolInHand(tool, hand, pose, &grip, nullptr);
+            held.inHand = relativeTo(frame, p);
+            held.have = true;
+            char message[160]{};
+            std::snprintf(message, sizeof(message), "  %s in the hand at (%.1f, %.1f, %.1f) in the hand frame", name, local.x, local.y, local.z);
+            vrlockpick::runtime::logNote(message);
         }
         return putTool(tool, p, false);
     }
