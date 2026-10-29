@@ -1472,7 +1472,10 @@ namespace
             if (s.handTurning) {
                 // Catch up with the hand; a tiny value just keeps the tension.
                 const float behind = target - menu.lockAngle;
-                const float strength = behind > 1.0f ? std::clamp(behind / 15.0f, 0.15f, 1.0f) : 0.0005f;
+                // With the hand (nearly) all the way, push like a stick
+                // pushed all the way: a weaker push left the lock hanging at
+                // 87-88 degrees, a hair short of open.
+                const float strength = target >= 80.0f ? 1.0f : behind > 1.0f ? std::clamp(behind / 15.0f, 0.15f, 1.0f) : 0.0005f;
                 g_turnLock(&menu, strength);
             }
         }
