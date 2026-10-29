@@ -76,13 +76,16 @@ namespace
         // Screwdriver: moving the hand left (as you look at the lock) this
         // far, in game units, turns the lock all the way.
         float screwTurnDistance{ 10.0f };
+        // A pin this many degrees outside the spot still opens the lock
+        // (0 = exactly as the game).
+        float pinSnapDegrees{ 4.0f };
         // Moves a tool in the hand, in centimetres along the hand: X toward
         // the fingertips, Y out of the back of the hand, Z sideways.
-        float pinOffset[3]{};
-        float screwOffset[3]{};
+        float pinOffset[3]{ -2.0f, 0.0f, 2.0f };
+        float screwOffset[3]{ -5.0f, 0.0f, -5.0f };
         // The same, for how the hand holds a tool once it is in the lock.
-        float pinLockOffset[3]{};
-        float screwLockOffset[3]{};
+        float pinLockOffset[3]{ 7.0f, 3.0f, -9.0f };
+        float screwLockOffset[3]{ -3.0f, -4.0f, -1.0f };
         // The screwdriver hand buzzes while the lock is turned as far as the
         // pin lets it (the pin bending); a broken pin jolts both hands.
         bool lockStrainBuzz{ true };
@@ -196,6 +199,8 @@ namespace
                     g_settings.screwSign = value;
                 } else if (key == "bSweetSpotBuzz") {
                     g_settings.sweetSpotBuzz = value != 0.0f;
+                } else if (key == "fPinSnapDegrees") {
+                    g_settings.pinSnapDegrees = value;
                 } else if (key == "fScrewTurnDistance") {
                     g_settings.screwTurnDistance = value;
                 } else if (key == "fPinOffsetX" || key == "fPinOffsetY" || key == "fPinOffsetZ") {
@@ -1280,7 +1285,7 @@ namespace
             --s.breakBuzzFrames;
             vrlockpick::haptics::pulse(true, 3999);
             vrlockpick::haptics::pulse(false, 3999);
-        } else if (menu.turningLock && menu.lockDamagePickAngle < 89.0f && menu.lockAngle >= menu.lockDamagePickAngle - 1.0f) {
+        } else if (menu.turningLock && menu.lockDamagePickAngle < 89.0f && menu.lockAngle >= menu.lockDamagePickAngle - 2.5f) {
             vrlockpick::haptics::pulse(!g_settings.leftHandPick, 1800);
         }
     }
@@ -1445,6 +1450,19 @@ namespace
             const float target = swung * g_settings.screwLockDegreesPerTwist;
             if (!s.handTurning && target > g_settings.armTurnStartDegrees) {
                 s.handTurning = true;
+                // A hand can't hold a pin as steady as a stick: a pin just
+                // outside the spot (the lock would stop a few degrees short)
+                // is eased onto its edge before the game judges it.
+                const float half = menu.sweetSpotLength * 0.5f;
+                const float off = menu.pickAngle - menu.sweetSpotCenter;
+                const float outside = std::fabs(off) - half;
+                if (outside > 0.0f && outside <= g_settings.pinSnapDegrees) {
+                    menu.pickAngle = menu.sweetSpotCenter + (off > 0.0f ? half - 0.5f : -(half - 0.5f));
+                    s.armPickAngle = menu.pickAngle;
+                    char message[120]{};
+                    std::snprintf(message, sizeof(message), "  pin eased %.1f degrees onto the spot", outside + 0.5f);
+                    vrlockpick::runtime::logInfo(message);
+                }
                 vrlockpick::runtime::logInfo("Screwdriver twisted: lock turn on");
             } else if (s.handTurning && target < g_settings.armTurnStopDegrees) {
                 s.handTurning = false;
